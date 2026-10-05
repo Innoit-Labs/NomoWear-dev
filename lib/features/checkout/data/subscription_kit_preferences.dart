@@ -10,6 +10,7 @@ class SubscriptionKitPreferences {
 
   String? wardrobeKitId;
   String? wardrobeKitProductId;
+  String? wardrobeKitVariantId;
   int wardrobeKitDays = 0;
   String wardrobeKitName = '';
   int wardrobeKitMaxGarments = 0;
@@ -39,6 +40,7 @@ class SubscriptionKitPreferences {
     final prefs = await SharedPreferences.getInstance();
     wardrobeKitId = prefs.getString(_kWardrobeKitId);
     wardrobeKitProductId = prefs.getString(_kWardrobeKitProductId);
+    wardrobeKitVariantId = prefs.getString(_kWardrobeKitVariantId);
     wardrobeKitDays = prefs.getInt(_kWardrobeKitDays) ?? 0;
     wardrobeKitName = prefs.getString(_kWardrobeKitName) ?? '';
     wardrobeKitMaxGarments = prefs.getInt(_kWardrobeKitMaxGarments) ?? 0;
@@ -58,6 +60,7 @@ class SubscriptionKitPreferences {
   Future<void> saveFromKitSetup({
     required String kitId,
     String? wardrobeKitProductId,
+    String? wardrobeKitVariantId,
     required int kitDays,
     required String kitName,
     required int maxGarments,
@@ -73,6 +76,7 @@ class SubscriptionKitPreferences {
   }) async {
     wardrobeKitId = kitId;
     this.wardrobeKitProductId = wardrobeKitProductId;
+    this.wardrobeKitVariantId = wardrobeKitVariantId;
     wardrobeKitDays = kitDays;
     wardrobeKitName = kitName;
     wardrobeKitMaxGarments = maxGarments;
@@ -97,6 +101,7 @@ class SubscriptionKitPreferences {
   Future<void> clear() async {
     wardrobeKitId = null;
     wardrobeKitProductId = null;
+    wardrobeKitVariantId = null;
     wardrobeKitDays = 0;
     wardrobeKitName = '';
     wardrobeKitMaxGarments = 0;
@@ -113,6 +118,7 @@ class SubscriptionKitPreferences {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_kWardrobeKitId);
     await prefs.remove(_kWardrobeKitProductId);
+    await prefs.remove(_kWardrobeKitVariantId);
     await prefs.remove(_kWardrobeKitDays);
     await prefs.remove(_kWardrobeKitName);
     await prefs.remove(_kWardrobeKitMaxGarments);
@@ -132,6 +138,7 @@ class SubscriptionKitPreferences {
     final prefs = await SharedPreferences.getInstance();
     await _setString(prefs, _kWardrobeKitId, wardrobeKitId);
     await _setString(prefs, _kWardrobeKitProductId, wardrobeKitProductId);
+    await _setString(prefs, _kWardrobeKitVariantId, wardrobeKitVariantId);
     await prefs.setInt(_kWardrobeKitDays, wardrobeKitDays);
     await _setString(prefs, _kWardrobeKitName, wardrobeKitName);
     await prefs.setInt(_kWardrobeKitMaxGarments, wardrobeKitMaxGarments);
@@ -170,6 +177,7 @@ class SubscriptionKitPreferences {
 
 const String _kWardrobeKitId = 'sub_kit_wardrobe_kit_id';
 const String _kWardrobeKitProductId = 'sub_kit_wardrobe_kit_product_id';
+const String _kWardrobeKitVariantId = 'sub_kit_wardrobe_kit_variant_id';
 const String _kWardrobeKitDays = 'sub_kit_wardrobe_kit_days';
 const String _kWardrobeKitName = 'sub_kit_wardrobe_kit_name';
 const String _kWardrobeKitMaxGarments = 'sub_kit_wardrobe_kit_max_garments';

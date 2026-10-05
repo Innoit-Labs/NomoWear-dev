@@ -21,12 +21,15 @@ class AuthStorage {
     await prefs.setString(_mobileKey, mobileNumber);
   }
 
+  static String? _cachedAuthToken;
+
   Future<void> saveAuthenticatedSession({
     required String authToken,
     required String customerId,
     required String mobileNumber,
     bool profileComplete = false,
   }) async {
+    _cachedAuthToken = authToken;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_authTokenKey, authToken);
     await prefs.setString(_customerIdKey, customerId);
@@ -70,8 +73,15 @@ class AuthStorage {
   }
 
   Future<String?> getAuthToken() async {
+    if (_cachedAuthToken != null && _cachedAuthToken!.isNotEmpty) {
+      return _cachedAuthToken;
+    }
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getString(_authTokenKey);
+    final token = prefs.getString(_authTokenKey);
+    if (token != null && token.isNotEmpty) {
+      _cachedAuthToken = token;
+    }
+    return token;
   }
 
   /// Prints the persisted auth token (debug builds only).
@@ -104,6 +114,7 @@ class AuthStorage {
   /// Prefer [SessionCleanup.clearUserSessionAndBlocs] from UI so Cart/Favorites
   /// Blocs are also reset.
   Future<void> clear() async {
+    _cachedAuthToken = null;
     await SessionCleanup.clearUserSession();
   }
 }

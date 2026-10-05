@@ -475,7 +475,7 @@ class _AddNewAddressScreenState extends State<AddNewAddressScreen> {
               padding: EdgeInsets.fromLTRB(20.w, 8.h, 20.w, 20.h),
               child: SizedBox(
                 width: double.infinity,
-                height: 52.h,
+                height: 44.h,
                 child: DecoratedBox(
                   decoration: BoxDecoration(
                     borderRadius: BorderRadius.circular(12),

@@ -79,8 +79,8 @@ class Product {
     final kitItems = <ProductKitItem>[];
     if (kitRaw is List) {
       for (final item in kitRaw) {
-        if (item is Map<String, dynamic>) {
-          kitItems.add(ProductKitItem.fromJson(item));
+        if (item is Map) {
+          kitItems.add(ProductKitItem.fromJson(Map<String, dynamic>.from(item)));
         }
       }
     }
@@ -98,8 +98,8 @@ class Product {
     final items = <Product>[];
     if (itemsRaw is List) {
       for (final item in itemsRaw) {
-        if (item is Map<String, dynamic>) {
-          items.add(Product.fromJson(item));
+        if (item is Map) {
+          items.add(Product.fromJson(Map<String, dynamic>.from(item)));
         }
       }
     }
@@ -108,8 +108,8 @@ class Product {
     final variants = <ProductVariant>[];
     if (variantsRaw is List) {
       for (final variant in variantsRaw) {
-        if (variant is Map<String, dynamic>) {
-          variants.add(ProductVariant.fromJson(variant));
+        if (variant is Map) {
+          variants.add(ProductVariant.fromJson(Map<String, dynamic>.from(variant)));
         }
       }
     }

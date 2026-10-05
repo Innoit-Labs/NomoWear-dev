@@ -20,6 +20,7 @@ import 'package:nomowear/features/profile/data/profile_cache.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
 import 'package:nomowear/features/profile/presentation/screens/profile_screen.dart';
 import 'package:nomowear/features/notifications/presentation/screens/notifications_screen.dart';
+import 'package:nomowear/features/notifications/data/notifications_repository.dart';
 import 'package:nomowear/features/cart/presentation/screens/cart_screen.dart';
 import 'package:nomowear/features/cart/presentation/bloc/cart_bloc.dart';
 import 'package:nomowear/features/checkout/presentation/utils/wardrobe_booking_flow.dart';
@@ -53,6 +54,9 @@ class _HomeScreenState extends State<HomeScreen> {
   final CategoryRepository _categoryRepository = CategoryRepository();
   final BannerRepository _bannerRepository = BannerRepository();
   final AuthStorage _authStorage = AuthStorage();
+  final NotificationsRepository _notificationsRepository =
+      NotificationsRepository();
+  bool _hasUnreadNotifications = false;
   Customer? _profile;
   bool _isLoadingProfile = true;
 
@@ -86,6 +90,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _loadProfile();
       _loadCategories();
       _loadBanners();
+      _checkUnreadNotifications();
     }
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
@@ -105,7 +110,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _refreshAfterPaymentSuccess() async {
     if (_didPostPaymentRefresh || _isRefreshingHome) return;
     _didPostPaymentRefresh = true;
-    _isRefreshingHome = true;
+    if (mounted) {
+      setState(() {
+        _isRefreshingHome = true;
+      });
+    }
     if (kDebugMode) {
       debugPrint('[HOME_REFRESH] START source=${widget.refreshSource}');
     }
@@ -165,7 +174,11 @@ class _HomeScreenState extends State<HomeScreen> {
         debugPrint('[HOME_REFRESH] STATE_UPDATED');
       }
     } finally {
-      _isRefreshingHome = false;
+      if (mounted) {
+        setState(() {
+          _isRefreshingHome = false;
+        });
+      }
     }
   }
 
@@ -173,6 +186,9 @@ class _HomeScreenState extends State<HomeScreen> {
     bool forceRefresh = false,
     bool propagateError = false,
   }) async {
+    if (forceRefresh && mounted) {
+      setState(() => _isLoadingProfile = true);
+    }
     final cached = ProfileCache.instance.customer;
     if (cached != null && !forceRefresh) {
       if (mounted) {
@@ -212,6 +228,9 @@ class _HomeScreenState extends State<HomeScreen> {
     bool forceRefresh = false,
     bool propagateError = false,
   }) async {
+    if (forceRefresh && mounted) {
+      setState(() => _isLoadingCategories = true);
+    }
     if (!forceRefresh) {
       final cached = CategoryCache.instance.categories;
       if (cached != null) {
@@ -294,6 +313,9 @@ class _HomeScreenState extends State<HomeScreen> {
     bool forceRefresh = false,
     bool propagateError = false,
   }) async {
+    if (forceRefresh && mounted) {
+      setState(() => _isLoadingBanners = true);
+    }
     // Skip memory cache when refreshing so admin updates are visible immediately.
     if (!forceRefresh) {
       final cached = BannerCache.instance.banners;
@@ -340,10 +362,21 @@ class _HomeScreenState extends State<HomeScreen> {
     _startAutoSlider();
   }
 
+  Future<void> _checkUnreadNotifications() async {
+    final hasUnread = await _notificationsRepository.hasUnreadNotifications();
+    if (mounted) {
+      setState(() => _hasUnreadNotifications = hasUnread);
+    }
+  }
+
   /// Pull-to-refresh: re-fetch all Home tab APIs in parallel, then stop indicator.
   Future<void> _onHomePullToRefresh() async {
     if (_isRefreshingHome) return;
-    _isRefreshingHome = true;
+    if (mounted) {
+      setState(() {
+        _isRefreshingHome = true;
+      });
+    }
 
     try {
       // Profile header, wardrobe categories, and promo banners.
@@ -361,6 +394,7 @@ class _HomeScreenState extends State<HomeScreen> {
           () => _loadBanners(forceRefresh: true, propagateError: true),
           errors,
         ),
+        _checkUnreadNotifications(),
       ]);
 
       if (!mounted || errors.isEmpty) return;
@@ -375,7 +409,11 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         );
     } finally {
-      _isRefreshingHome = false;
+      if (mounted) {
+        setState(() {
+          _isRefreshingHome = false;
+        });
+      }
     }
   }
 
@@ -492,6 +530,15 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  bool get _isHomeShimmering {
+    if (_isRefreshingHome) return true;
+    final hasNoData = _banners.isEmpty && _wardrobeCategories.isEmpty;
+    final isAnyLoading = _isLoadingCategories ||
+        _isLoadingBanners ||
+        (_isLoadingProfile && _profile == null);
+    return hasNoData && isAnyLoading;
+  }
+
   Widget _buildHomeContent() {
     // RefreshIndicator needs a scrollable child; AlwaysScrollable lets pull
     // work even when content is shorter than the viewport.
@@ -502,88 +549,63 @@ class _HomeScreenState extends State<HomeScreen> {
       onRefresh: _onHomePullToRefresh,
       child: SingleChildScrollView(
         physics: const AlwaysScrollableScrollPhysics(),
-        child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: 20.w),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              SizedBox(height: 20.h),
-              _buildHeader(),
-              SizedBox(height: 16.h),
-              Container(
-                height: 2,
-                width: double.infinity,
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.centerLeft,
-                    end: Alignment.centerRight,
-                    colors: [
-                      Color(0xFFE6C27A).withOpacity(0.15),
-                      Color(0xFFE6C27A),
-                      Color(0xFFE6C27A).withOpacity(0.15),
-                    ],
-                  ),
+        child: _isHomeShimmering
+            ? const HomeScreenShimmer()
+            : Padding(
+                padding: EdgeInsets.symmetric(horizontal: 20.w),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(height: 20.h),
+                    _buildHeader(),
+                    SizedBox(height: 16.h),
+                    Container(
+                      height: 2,
+                      width: double.infinity,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.centerLeft,
+                          end: Alignment.centerRight,
+                          colors: [
+                            Color(0xFFE6C27A).withOpacity(0.15),
+                            Color(0xFFE6C27A),
+                            Color(0xFFE6C27A).withOpacity(0.15),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+
+                    _buildBannerSlider(),
+                    SizedBox(height: 32.h),
+                    _buildWardrobeSectionTitle(),
+                    SizedBox(height: 20.h),
+                    _buildWardrobeGrid(),
+                    SizedBox(height: 24.h),
+                    _buildEssentialsBanner(),
+                    SizedBox(height: 40.h),
+                  ],
                 ),
               ),
-              SizedBox(height: 16.h),
-
-              _buildBannerSlider(),
-              SizedBox(height: 32.h),
-              Text(
-                "Choose Your Wardrobe",
-                style: CustomTextStyles.montserratBold.copyWith(fontSize: 20),
-              ),
-              SizedBox(height: 20.h),
-              _buildWardrobeGrid(),
-              SizedBox(height: 24.h),
-              _buildEssentialsBanner(),
-              SizedBox(height: 40.h),
-            ],
-          ),
-        ),
       ),
     );
   }
 
-  Widget _buildCategoriesContent() {
-    return SingleChildScrollView(
-      child: Padding(
-        padding: EdgeInsets.symmetric(horizontal: 20.w),
-        child: Column(
-          children: [
-            SizedBox(height: 20.h),
-            Text(
-              "Categories",
-              style: TextStyle(
-                color: AppColours.primary,
-                fontSize: 20.fSize,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            SizedBox(height: 12.h),
-            Divider(color: AppColours.primary.withOpacity(0.2)),
-            SizedBox(height: 24.h),
-            Text(
-              "Choose Your Wardrobe",
-              style: TextStyle(
-                color: AppColours.secondary,
-                fontSize: 20.fSize,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            SizedBox(height: 24.h),
-            _buildWardrobeGrid(),
-            SizedBox(height: 24.h),
-            _buildEssentialsBanner(),
-            SizedBox(height: 40.h),
-          ],
-        ),
-      ),
+  Widget _buildWardrobeSectionTitle() {
+    if (_isLoadingCategories && _wardrobeCategories.isEmpty) {
+      return AppShimmer(
+        child: AppShimmer.box(width: 210.w, height: 22.h, borderRadius: 6),
+      );
+    }
+    return Text(
+      "Choose Your Wardrobe",
+      style: CustomTextStyles.montserratBold.copyWith(fontSize: 20),
     );
   }
+
 
   Widget _buildHeader() {
-    if (_isLoadingProfile && _profile == null) {
+    if (_isRefreshingHome || (_isLoadingProfile && _profile == null)) {
       return const HomeHeaderShimmer();
     }
 
@@ -670,16 +692,43 @@ class _HomeScreenState extends State<HomeScreen> {
             // ),
             SizedBox(width: 8.w),
             GestureDetector(
-              onTap: () {
-                Navigator.push(
+              onTap: () async {
+                setState(() => _hasUnreadNotifications = false);
+                await Navigator.push(
                   context,
                   MaterialPageRoute(
                     builder: (_) => const NotificationsScreen(),
                   ),
                 );
+                if (mounted) {
+                  setState(() => _hasUnreadNotifications = false);
+                  _checkUnreadNotifications();
+                }
               },
-              child:SvgPicture.asset(IconConstant.notification)
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  SvgPicture.asset(IconConstant.notification),
+                  if (_hasUnreadNotifications)
+                    Positioned(
+                      top: 0,
+                      right: 0,
+                      child: Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: AppColours.primary,
+                          border: Border.all(
+                            color: const Color(0xFF070A14),
+                            width: 1.5,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
+            ),
 
           ],
         ),
@@ -688,7 +737,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildBannerSlider() {
-    if (_isLoadingBanners) {
+    if (_isRefreshingHome || _isLoadingBanners) {
       return const BannerShimmer();
     }
 
@@ -785,7 +834,7 @@ class _HomeScreenState extends State<HomeScreen> {
               onPressed: () {},
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFFE6C279),
-                minimumSize: Size(138.w, 54.h),
+                minimumSize: Size(138.w, 44.h),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(8),
                 ),
@@ -828,7 +877,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildWardrobeGrid() {
-    if (_isLoadingCategories) {
+    if (_isRefreshingHome || _isLoadingCategories) {
       return const WardrobeGridShimmer();
     }
 
@@ -982,7 +1031,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildEssentialsBanner() {
-    if (_isLoadingCategories) {
+    if (_isRefreshingHome || _isLoadingCategories) {
       return const EssentialsBannerShimmer();
     }
 

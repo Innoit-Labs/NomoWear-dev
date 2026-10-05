@@ -10,7 +10,6 @@ import 'package:nomowear/features/home/presentation/screens/subscription_tab_wid
 import 'package:nomowear/features/subscriptions/data/subscription_cache.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_garment_balance.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
-import 'package:nomowear/features/products/data/models/product_variant.dart';
 import 'package:flutter/foundation.dart';
 
 Future<void> continueWithoutMembershipFromUnlock(BuildContext context) async {
@@ -863,7 +862,12 @@ bool tryAddToCart(BuildContext context, CartItem item) {
     itemType: resolvedItem.itemType,
   );
   final lineId = existing?.id ?? resolvedItem.id;
-  if (cartState.isLinePending(lineId)) {
+  if (cartState.isLinePending(lineId) ||
+      cartState.isProductPending(
+        productId: resolvedItem.productId,
+        variantId: resolvedItem.variantId,
+        itemType: resolvedItem.itemType,
+      )) {
     return false;
   }
 
@@ -874,7 +878,7 @@ bool tryAddToCart(BuildContext context, CartItem item) {
       if (vId.isNotEmpty) {
         for (final v in product.variants) {
           if (v.id == vId) {
-            if (v.stockOnHand >= 0 && existing.quantity >= v.stockOnHand) {
+            if (v.stockOnHand > 0 && existing.quantity >= v.stockOnHand) {
               ScaffoldMessenger.of(context).clearSnackBars();
               ScaffoldMessenger.of(context).showSnackBar(
                 SnackBar(

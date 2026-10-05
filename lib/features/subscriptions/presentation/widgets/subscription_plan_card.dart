@@ -8,12 +8,14 @@ class SubscriptionPlanCard extends StatefulWidget {
     this.showCurrentPlanBadge = false,
     this.statusLabel,
     this.matchedFeatures,
+    this.onMembershipBooking,
   });
 
   final ActiveSubscription subscription;
   final bool showCurrentPlanBadge;
   final String? statusLabel;
   final List<String>? matchedFeatures;
+  final VoidCallback? onMembershipBooking;
 
   @override
   State<SubscriptionPlanCard> createState() => _SubscriptionPlanCardState();
@@ -71,13 +73,13 @@ class _SubscriptionPlanCardState extends State<SubscriptionPlanCard> {
               duration: const Duration(milliseconds: 300),
             ),
             if (widget.subscription.isActive) ...[
-              SizedBox(height: 24.h),
+              SizedBox(height: 20.h),
               Center(
                 child: Text(
                   'CURRENT PLAN',
                   style: CustomTextStyles.montserratBold.copyWith(
-                    fontSize: 14,
-                    color: AppColours.primary,
+                    fontSize: 12,
+                    color: AppColours.primary.withOpacity(0.8),
                     letterSpacing: 1.4,
                   ),
                 ),
@@ -146,6 +148,10 @@ class _SubscriptionPlanCardState extends State<SubscriptionPlanCard> {
               height: 1.3,
             ),
           ),
+        ],
+        if (widget.statusLabel != null && widget.statusLabel!.trim().isNotEmpty) ...[
+          SizedBox(height: 8.h),
+          _statusChip(widget.statusLabel!.trim()),
         ],
       ],
     );

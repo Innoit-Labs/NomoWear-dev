@@ -11,9 +11,14 @@ class PendingReturnStore {
 
   final Set<String> _ids = <String>{};
   bool _loaded = false;
+  Future<void>? _loading;
 
-  Future<void> ensureLoaded() async {
-    if (_loaded) return;
+  Future<void> ensureLoaded() {
+    if (_loaded) return Future<void>.value();
+    return _loading ??= _readPrefs();
+  }
+
+  Future<void> _readPrefs() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getStringList(_prefsKey) ?? const <String>[];
     _ids

@@ -192,12 +192,13 @@ class ApiClient {
   Future<Map<String, dynamic>> delete(
     String path, {
     required String authToken,
+    bool jsonBody = true,
   }) async {
     _logRequest(method: 'DELETE', path: path);
     return _request(
       () => _client.delete(
         _uri(path),
-        headers: _headers(authToken: authToken),
+        headers: _headers(authToken: authToken, jsonBody: jsonBody),
       ),
     );
   }

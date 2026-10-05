@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:nomowear/core/app_export.dart';
+import 'package:nomowear/core/services/auth_storage.dart';
 import 'package:nomowear/features/home/presentation/bloc/home_bloc.dart';
 import 'package:nomowear/features/cart/presentation/bloc/cart_bloc.dart';
 
@@ -60,6 +61,16 @@ class CustomBottomNav extends StatelessWidget {
 
     return GestureDetector(
       onTap: () {
+        if (index == 0) {
+          AuthStorage().getAuthToken().then((token) {
+            // ignore: avoid_print
+            print('════════════ AUTH TOKEN ════════════');
+            // ignore: avoid_print
+            print(token ?? 'No token stored');
+            // ignore: avoid_print
+            print('════════════════════════════════════');
+          });
+        }
         context.read<HomeBloc>().add(ChangeBottomNavEvent(index));
       },
       child: Container(

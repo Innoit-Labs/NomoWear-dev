@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/services/auth_storage.dart';
+import 'package:nomowear/core/services/firebase_messaging_service.dart';
 import 'package:nomowear/features/auth/data/auth_repository.dart';
 import 'package:nomowear/features/auth/presentation/bloc/otp_event.dart';
 import 'package:nomowear/features/auth/presentation/bloc/otp_state.dart';
@@ -83,6 +84,11 @@ class OtpBloc extends Bloc<OtpEvent, OtpState> {
         profileComplete:
             ProfileCompletionHelper.isProfileComplete(result.customer),
       );
+
+      // Register FCM token with backend
+      unawaited(FirebaseMessagingService.instance.sendTokenToServer(
+        authToken: result.authToken,
+      ));
 
       debugPrint('════════ LOGIN AUTH TOKEN ════════');
       debugPrint('Token: ${result.authToken}');

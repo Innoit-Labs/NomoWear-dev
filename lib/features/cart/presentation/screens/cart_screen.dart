@@ -40,6 +40,8 @@ class _CartScreenState extends State<CartScreen> {
   bool _isEssentialsExpanded = true;
   bool _isKidsExpanded = true;
   bool _isPreparingCheckout = false;
+  bool _isKitBreakdownExpanded = false;
+  bool _isDepositExpanded = false;
 
   static const List<String> _allSizes = ['XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL'];
   static const int _essentialsMaxQty = 5;
@@ -73,7 +75,7 @@ class _CartScreenState extends State<CartScreen> {
     }
 
     final variant = _resolveVariant(item);
-    if (variant != null && variant.stockOnHand >= 0) {
+    if (variant != null && variant.stockOnHand > 0) {
       maxQty = variant.stockOnHand;
     }
 
@@ -96,9 +98,6 @@ class _CartScreenState extends State<CartScreen> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
-      CheckoutSession.instance.restore().then((_) {
-        if (mounted) setState(() {});
-      });
       if (widget.isActive) {
         context.read<CartBloc>().add(
               LoadCartEvent(
@@ -175,28 +174,11 @@ class _CartScreenState extends State<CartScreen> {
                               ),
                       ),
                       if (!isEmpty && !showLoading)
-                        _buildPlaceOrderButton(context),
+                        _buildPlaceOrderButton(context, state),
                     ],
                   ),
                 ),
               ),
-              if (_isPreparingCheckout) ...[
-                const Positioned.fill(
-                  child: ColoredBox(color: Color(0x66000000)),
-                ),
-                const Positioned.fill(
-                  child: Center(
-                    child: SizedBox(
-                      width: 28,
-                      height: 28,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.5,
-                        color: Color(0xFFE6C27A),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
         ),
@@ -299,7 +281,7 @@ class _CartScreenState extends State<CartScreen> {
               isExpanded: _isNonSubscriptionKitExpanded,
               onToggle: () => setState(() => _isNonSubscriptionKitExpanded = !_isNonSubscriptionKitExpanded),
               sectionTitle: 'NON-SUBSCRIPTION ITEMS',
-              showGarmentPrices: true,
+              showGarmentPrices: false,
             ),
           ],
           if (essentialItems.isNotEmpty) ...[
@@ -358,7 +340,9 @@ class _CartScreenState extends State<CartScreen> {
           _buildDeliveryDetails(),
           SizedBox(height: 28.h),
           _buildAddNote(),
-          SizedBox(height: 16.h),
+          SizedBox(height: 28.h),
+          _buildCartItemsBreakdown(context, state),
+          SizedBox(height: 20.h),
           _buildTermsText(context),
           SizedBox(height: 24.h),
         ],
@@ -616,7 +600,7 @@ class _CartScreenState extends State<CartScreen> {
     required bool isExpanded,
     required VoidCallback onToggle,
     String sectionTitle = 'SELECTED WARDROBE',
-    bool showGarmentPrices = true,
+    bool showGarmentPrices = false,
   }) {
     final garmentCount =
         wardrobeItems.fold<int>(0, (sum, item) => sum + item.quantity);
@@ -802,7 +786,7 @@ class _CartScreenState extends State<CartScreen> {
     return ReusableProductCartItem(
       item: item,
       state: state,
-      showPrice: showPrice ?? !isWardrobe,
+      showPrice: isWardrobe ? false : (showPrice ?? true),
     );
   }
 
@@ -1032,7 +1016,12 @@ class _CartScreenState extends State<CartScreen> {
     );
   }
 
-  Widget _buildPlaceOrderButton(BuildContext context) {
+  Widget _buildPlaceOrderButton(BuildContext context, CartState state) {
+    final amounts = _resolveCartBreakdownAmounts(state);
+    final buttonLabel = amounts.totalDue > 0
+        ? 'Proceed to Payment'
+        : 'PLACE ORDER';
+
     return Container(
       width: double.maxFinite,
       padding: EdgeInsets.all(20.w),
@@ -1041,21 +1030,605 @@ class _CartScreenState extends State<CartScreen> {
         border: Border(top: BorderSide(color: Colors.white12)),
       ),
       child: ElevatedButton(
-        onPressed: () => _onPlaceOrderPressed(context),
+        onPressed: _isPreparingCheckout
+            ? null
+            : () => _onPlaceOrderPressed(context),
         style: ElevatedButton.styleFrom(
           backgroundColor: AppColours.primary,
+          disabledBackgroundColor: AppColours.primary.withOpacity(0.6),
           minimumSize: Size(double.maxFinite, 54.h),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
-        child: Text(
-          'PLACE ORDER',
+        child: _isPreparingCheckout
+            ? SizedBox(
+                width: 22.w,
+                height: 22.w,
+                child: const CircularProgressIndicator(
+                  strokeWidth: 2.2,
+                  color: Colors.black,
+                ),
+              )
+            : Text(
+                buttonLabel,
+                style: TextStyle(
+                  color: Colors.black,
+                  fontSize: 16.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+      ),
+    );
+  }
+
+  _CartBreakdownAmounts _resolveCartBreakdownAmounts(CartState state) {
+    final isSubscription = _isSubscriptionWardrobeBooking(state);
+
+    // 1. Kit Price
+    num kitPrice = 0;
+    if (!isSubscription) {
+      if (state.remote.activeKitPrice > 0) {
+        kitPrice = state.remote.activeKitPrice;
+      } else {
+        kitPrice = CheckoutPricing.wardrobeKitPriceFromState(state);
+      }
+      if (kitPrice <= 0 && state.wardrobeItems.isNotEmpty) {
+        kitPrice = state.wardrobeItems.fold<num>(
+          0,
+          (sum, item) =>
+              sum +
+              (CheckoutPricing.parseItemPrice(item.price, isEssential: false) *
+                  item.quantity),
+        );
+      }
+    }
+
+    // 2. Deposit Amount
+    num depositAmount = 0;
+    if (!isSubscription) {
+      if (state.remote.securityDepositAmount > 0) {
+        depositAmount = state.remote.securityDepositAmount;
+      }
+    }
+
+    // 3. Subtotal
+    final directSum = state.essentialItems.fold<num>(
+      0,
+      (sum, item) =>
+          sum +
+          (CheckoutPricing.parseItemPrice(item.price, isEssential: item.isEssential) *
+              item.quantity),
+    );
+    num subtotal = isSubscription ? 0 : (kitPrice + directSum);
+    if (subtotal <= 0 && state.remote.subtotal > 0) {
+      subtotal = state.remote.subtotal;
+    }
+
+    // 4. Delivery Fee
+    num deliveryFee = state.remote.deliveryCharge;
+
+    // 5. Tax (GST 18%)
+    num taxAmount = state.remote.taxAmount;
+    if (taxAmount <= 0 && subtotal > 0 && !isSubscription) {
+      taxAmount = (subtotal * 0.18);
+    }
+
+    // 6. Order Total (Rentals + Delivery + GST)
+    num orderTotal = subtotal + deliveryFee + taxAmount - state.remote.discountAmount;
+    if (orderTotal < 0) orderTotal = 0;
+
+    // 7. Total Due at Checkout
+    num totalDue = orderTotal + depositAmount;
+    if (state.remote.totalAmount > 0 && state.remote.totalAmount > totalDue) {
+      totalDue = state.remote.totalAmount;
+    }
+
+    return _CartBreakdownAmounts(
+      kitPrice: kitPrice,
+      depositAmount: depositAmount,
+      subtotal: subtotal,
+      deliveryFee: deliveryFee,
+      taxAmount: taxAmount,
+      orderTotal: orderTotal,
+      totalDue: totalDue,
+      isSubscription: isSubscription,
+    );
+  }
+
+  String _formatCurrency(
+    num value, {
+    bool forceDecimals = false,
+    bool keepDecimalIfPresent = false,
+  }) {
+    final isNegative = value < 0;
+    final absVal = value.abs();
+
+    String numberPart;
+    if (forceDecimals) {
+      numberPart = absVal.toStringAsFixed(2);
+    } else if (keepDecimalIfPresent) {
+      if (absVal == absVal.truncateToDouble()) {
+        numberPart = absVal.toInt().toString();
+      } else {
+        final raw = absVal.toString();
+        if (raw.contains('.') && raw.split('.')[1].length > 2) {
+          numberPart = absVal.toStringAsFixed(2);
+        } else {
+          numberPart = raw;
+        }
+      }
+    } else {
+      if (absVal == absVal.truncateToDouble()) {
+        numberPart = absVal.toInt().toString();
+      } else {
+        numberPart = absVal.toStringAsFixed(2);
+      }
+    }
+
+    final parts = numberPart.split('.');
+    final whole = parts[0];
+    final decimal = parts.length > 1 ? '.${parts[1]}' : '';
+
+    String formattedWhole = whole;
+    if (whole.length > 3) {
+      final lastThree = whole.substring(whole.length - 3);
+      final otherNumbers = whole.substring(0, whole.length - 3);
+      final formattedOther = otherNumbers.replaceAllMapped(
+        RegExp(r'(\d)(?=(\d{2})+(?!\d))'),
+        (Match m) => '${m[1]},',
+      );
+      formattedWhole = '$formattedOther,$lastThree';
+    }
+
+    return '${isNegative ? "-₹" : "₹"}$formattedWhole$decimal';
+  }
+
+  Widget _buildSummaryRow(String label, String value, {bool isHighlight = false}) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
           style: TextStyle(
-            color: Colors.black,
-            fontSize: 16.fSize,
+            color: Colors.white70,
+            fontSize: 13.5.fSize,
+            fontWeight: FontWeight.w400,
+          ),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: isHighlight ? const Color(0xFFE6C27A) : Colors.white,
+            fontSize: 13.5.fSize,
             fontWeight: FontWeight.bold,
           ),
         ),
-      ),
+      ],
+    );
+  }
+
+  Widget _buildCartItemsBreakdown(BuildContext context, CartState state) {
+    final amounts = _resolveCartBreakdownAmounts(state);
+    final hasWardrobe = state.wardrobeItems.isNotEmpty;
+    final kitGarmentCount = state.wardrobeGarmentCount > 0
+        ? state.wardrobeGarmentCount
+        : state.totalItems;
+    final kitDays = state.wardrobeKitDays > 0 ? state.wardrobeKitDays : 1;
+    final kitTitle = state.wardrobeKitTitle.isNotEmpty
+        ? state.wardrobeKitTitle
+        : '$kitDays-Day wardrobe Kit';
+    final wardrobeGarments = state.wardrobeItems;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Section Header with Dotted Lines
+        Row(
+          children: [
+            Expanded(
+              child: _DottedDivider(
+                color: const Color(0xFFD8B26A).withOpacity(0.5),
+                dashWidth: 4,
+                dashSpace: 4,
+              ),
+            ),
+            Padding(
+              padding: EdgeInsets.symmetric(horizontal: 10.w),
+              child: Text(
+                'CART ITEMS BREAKDOWN',
+                style: TextStyle(
+                  color: const Color(0xFFD8B26A),
+                  fontSize: 12.fSize,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1.5,
+                ),
+              ),
+            ),
+            Expanded(
+              child: _DottedDivider(
+                color: const Color(0xFFD8B26A).withOpacity(0.5),
+                dashWidth: 4,
+                dashSpace: 4,
+              ),
+            ),
+          ],
+        ),
+
+        // Wardrobe Kit Card with Dotted Border
+        if (hasWardrobe) ...[
+          SizedBox(height: 16.h),
+          DottedBorder(
+            color: const Color(0xFFD8B26A).withOpacity(0.6),
+            strokeWidth: 1.2,
+            dashPattern: const [5, 4],
+            borderType: BorderType.RRect,
+            radius: const Radius.circular(12),
+            child: Container(
+              padding: EdgeInsets.all(14.w),
+              decoration: BoxDecoration(
+                color: const Color(0xFF161824).withOpacity(0.6),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  InkWell(
+                    onTap: () => setState(() => _isKitBreakdownExpanded = !_isKitBreakdownExpanded),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                kitTitle,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 14.5.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              SizedBox(height: 4.h),
+                              Text(
+                                '$kitGarmentCount Items',
+                                style: TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 12.5.fSize,
+                                  fontWeight: FontWeight.w400,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              amounts.isSubscription
+                                  ? '₹0 (Plan)'
+                                  : _formatCurrency(amounts.kitPrice, forceDecimals: false),
+                              style: TextStyle(
+                                color: const Color(0xFFE6C27A),
+                                fontSize: 15.fSize,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                            SizedBox(width: 4.w),
+                            Icon(
+                              _isKitBreakdownExpanded
+                                  ? Icons.keyboard_arrow_up_rounded
+                                  : Icons.keyboard_arrow_down_rounded,
+                              color: const Color(0xFFE6C27A),
+                              size: 20,
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  if (amounts.depositAmount > 0) ...[
+                    SizedBox(height: 8.h),
+                    Text(
+                      'Deposit Hold: ${_formatCurrency(amounts.depositAmount, forceDecimals: false)} ($kitGarmentCount items)',
+                      style: TextStyle(
+                        color: const Color(0xFFE59438),
+                        fontSize: 11.5.fSize,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                  if (_isKitBreakdownExpanded) ...[
+                    SizedBox(height: 12.h),
+                    Divider(color: Colors.white12),
+                    SizedBox(height: 8.h),
+                    ...wardrobeGarments.map((g) => Padding(
+                          padding: EdgeInsets.symmetric(vertical: 4.h),
+                          child: Row(
+                            children: [
+                              if (g.imageUrl.isNotEmpty)
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: Image.network(
+                                    g.imageUrl,
+                                    width: 32.w,
+                                    height: 32.w,
+                                    fit: BoxFit.cover,
+                                    errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+                                  ),
+                                ),
+                              SizedBox(width: 8.w),
+                              Expanded(
+                                child: Text(
+                                  g.title,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12.fSize,
+                                  ),
+                                ),
+                              ),
+                              if (g.selectedSize.isNotEmpty)
+                                Text(
+                                  'Size: ${g.selectedSize}',
+                                  style: TextStyle(
+                                    color: Colors.white38,
+                                    fontSize: 11.fSize,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        )),
+                  ],
+                ],
+              ),
+            ),
+          ),
+        ],
+
+        // Dotted Divider
+        SizedBox(height: 20.h),
+        _DottedDivider(color: Colors.white24, dashWidth: 4, dashSpace: 4),
+        SizedBox(height: 16.h),
+
+        // Items Subtotal
+        _buildSummaryRow(
+          'Items Subtotal',
+          _formatCurrency(amounts.subtotal, forceDecimals: true),
+        ),
+        SizedBox(height: 12.h),
+
+        // Delivery Fee
+        _buildSummaryRow(
+          'Delivery Fee',
+          amounts.deliveryFee > 0
+              ? _formatCurrency(amounts.deliveryFee, keepDecimalIfPresent: true)
+              : 'FREE',
+        ),
+        SizedBox(height: 12.h),
+
+        // Taxes (GST 18%)
+        _buildSummaryRow(
+          'Taxes (GST 18%)',
+          _formatCurrency(amounts.taxAmount, forceDecimals: true),
+        ),
+        SizedBox(height: 16.h),
+
+        // Order Total Container
+        Container(
+          padding: EdgeInsets.symmetric(horizontal: 14.w, vertical: 12.h),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1C1F26),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Order Total (Rentals + Delivery + GST)',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.9),
+                  fontSize: 12.5.fSize,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              Text(
+                _formatCurrency(amounts.orderTotal, forceDecimals: true),
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13.5.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+
+        // Refundable Security Deposit Card
+        if (amounts.depositAmount > 0) ...[
+          SizedBox(height: 16.h),
+          Container(
+            padding: EdgeInsets.all(12.w),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1B1812),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: const Color(0xFFD8B26A).withOpacity(0.7),
+                width: 1.2,
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                InkWell(
+                  onTap: () => setState(() => _isDepositExpanded = !_isDepositExpanded),
+                  child: Row(
+                    children: [
+                      const Icon(
+                        Icons.shield_outlined,
+                        color: Color(0xFFD8B26A),
+                        size: 20,
+                      ),
+                      SizedBox(width: 8.w),
+                      Expanded(
+                        child: RichText(
+                          text: TextSpan(
+                            children: [
+                              TextSpan(
+                                text: 'Refundable Security Deposit ',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12.5.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              TextSpan(
+                                text: '(Temporary Hold)',
+                                style: TextStyle(
+                                  color: Colors.white60,
+                                  fontSize: 11.5.fSize,
+                                  fontWeight: FontWeight.normal,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Text(
+                        _formatCurrency(amounts.depositAmount, forceDecimals: true),
+                        style: TextStyle(
+                          color: const Color(0xFFE6C27A),
+                          fontSize: 13.5.fSize,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      SizedBox(width: 4.w),
+                      Icon(
+                        _isDepositExpanded
+                            ? Icons.keyboard_arrow_up_rounded
+                            : Icons.keyboard_arrow_down_rounded,
+                        color: const Color(0xFFE6C27A),
+                        size: 18,
+                      ),
+                    ],
+                  ),
+                ),
+                if (_isDepositExpanded) ...[
+                  SizedBox(height: 10.h),
+                  Divider(color: Colors.white12),
+                  SizedBox(height: 8.h),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Deposit Status',
+                          style: TextStyle(
+                            color: Colors.white70,
+                            fontSize: 11.fSize,
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: EdgeInsets.symmetric(horizontal: 6.w, vertical: 2.h),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2A2214),
+                          borderRadius: BorderRadius.circular(4),
+                          border: Border.all(
+                            color: const Color(0xFFD8B26A).withOpacity(0.5),
+                          ),
+                        ),
+                        child: Text(
+                          'HOLD ACTIVE · REFUNDABLE',
+                          style: TextStyle(
+                            color: const Color(0xFFE6C27A),
+                            fontSize: 9.5.fSize,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  SizedBox(height: 8.h),
+                  Container(
+                    padding: EdgeInsets.all(8.w),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF0A261E),
+                      borderRadius: BorderRadius.circular(6),
+                      border: Border.all(
+                        color: const Color(0xFF10B981).withOpacity(0.35),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.lock_outline_rounded,
+                          color: Color(0xFFD8B26A),
+                          size: 14,
+                        ),
+                        SizedBox(width: 6.w),
+                        Expanded(
+                          child: Text(
+                            '100% refunded to your payment source upon safe return of garments.',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 10.5.fSize,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
+
+        // Dotted Divider
+        SizedBox(height: 16.h),
+        _DottedDivider(color: Colors.white24, dashWidth: 4, dashSpace: 4),
+        SizedBox(height: 16.h),
+
+        // Total Due at Checkout
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Total Due at Checkout',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                if (amounts.depositAmount > 0) ...[
+                  SizedBox(height: 4.h),
+                  Text(
+                    'Includes ${_formatCurrency(amounts.depositAmount, forceDecimals: false)} refundable hold',
+                    style: TextStyle(
+                      color: Colors.white54,
+                      fontSize: 11.5.fSize,
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+            Text(
+              _formatCurrency(amounts.totalDue, forceDecimals: true),
+              style: TextStyle(
+                color: const Color(0xFFE6C27A),
+                fontSize: 22.fSize,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -1079,9 +1652,7 @@ class _CartScreenState extends State<CartScreen> {
       final remoteCart = await bloc.refresh(source: 'CartScreen.checkout');
       if (!context.mounted) return;
       if (remoteCart.isEmpty) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Your cart is empty')),
-        );
+        CustomAppSnackBar.showInfo(context, 'Your cart is empty');
         return;
       }
 
@@ -1109,14 +1680,11 @@ class _CartScreenState extends State<CartScreen> {
       }
 
       if (!initiate.canOpenRazorpay) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              initiate.requiresPayment
-                  ? 'Payment details missing from server. Please try again.'
-                  : 'Unable to load payable amount. Please try again.',
-            ),
-          ),
+        CustomAppSnackBar.showError(
+          context,
+          initiate.requiresPayment
+              ? 'Payment details missing from server. Please try again.'
+              : 'Unable to load payable amount. Please try again.',
         );
         return;
       }
@@ -1140,18 +1708,72 @@ class _CartScreenState extends State<CartScreen> {
       );
     } on ApiException catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
+      CustomAppSnackBar.showError(context, e.message);
     } catch (_) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to prepare checkout. Please try again.'),
-        ),
+      CustomAppSnackBar.showError(
+        context,
+        'Unable to prepare checkout. Please try again.',
       );
     } finally {
       if (mounted) setState(() => _isPreparingCheckout = false);
     }
   }
 }
+
+class _CartBreakdownAmounts {
+  const _CartBreakdownAmounts({
+    required this.kitPrice,
+    required this.depositAmount,
+    required this.subtotal,
+    required this.deliveryFee,
+    required this.taxAmount,
+    required this.orderTotal,
+    required this.totalDue,
+    required this.isSubscription,
+  });
+
+  final num kitPrice;
+  final num depositAmount;
+  final num subtotal;
+  final num deliveryFee;
+  final num taxAmount;
+  final num orderTotal;
+  final num totalDue;
+  final bool isSubscription;
+}
+
+class _DottedDivider extends StatelessWidget {
+  const _DottedDivider({
+    this.color = Colors.white24,
+    this.dashWidth = 4.0,
+    this.dashSpace = 4.0,
+  });
+
+  final Color color;
+  final double dashWidth;
+  final double dashSpace;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final boxWidth = constraints.constrainWidth();
+        final dashCount = (boxWidth / (dashWidth + dashSpace)).floor();
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: List.generate(dashCount > 0 ? dashCount : 1, (_) {
+            return SizedBox(
+              width: dashWidth,
+              height: 1,
+              child: DecoratedBox(
+                decoration: BoxDecoration(color: color),
+              ),
+            );
+          }),
+        );
+      },
+    );
+  }
+}
+

@@ -27,15 +27,13 @@ import 'package:nomowear/features/products/data/models/product_variant.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
 import 'package:nomowear/features/products/data/product_mapper.dart';
 import 'package:nomowear/features/wardrobe/presentation/widgets/variant_selection_sheet.dart';
-import 'package:nomowear/features/cart/presentation/widgets/reusable_product_cart_item.dart';
-import 'package:nomowear/features/products/data/models/product_variant.dart';
-import 'package:nomowear/features/products/data/product_cache.dart';
-import 'package:nomowear/features/products/data/product_mapper.dart';
-import 'package:nomowear/features/wardrobe/presentation/widgets/variant_selection_sheet.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_garment_balance.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_repository.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_cache.dart';
+import 'package:nomowear/features/checkout/presentation/widgets/payment_pending_confirmation_sheet.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';
+
+import '../../../cart/presentation/widgets/reusable_product_cart_item.dart';
 
 class EssentialsCheckoutScreen extends StatefulWidget {
   const EssentialsCheckoutScreen({
@@ -59,6 +57,10 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
 
   bool _isPlacingOrder = false;
   bool _wardrobeGarmentsExpanded = false;
+
+  bool _hasOpenedPayment = false;
+  String? _activePendingOrderId;
+  CheckoutPayableSnapshot? _activePendingSnapshot;
 
   // CHANGE: Backend-only payable snapshot (initiate-order amount = Razorpay amount).
   CheckoutPayableSnapshot? _payableSnapshot;
@@ -126,10 +128,9 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     if (orderId.isEmpty || paymentId.isEmpty || signature.isEmpty) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Payment details incomplete. Please contact support.'),
-        ),
+      CustomAppSnackBar.showError(
+        context,
+        'Payment details incomplete. Please contact support.',
       );
       return;
     }
@@ -150,16 +151,13 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
+      CustomAppSnackBar.showError(context, e.message);
     } catch (_) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to verify payment. Please try again.'),
-        ),
+      CustomAppSnackBar.showError(
+        context,
+        'Unable to verify payment. Please try again.',
       );
     }
   }
@@ -167,10 +165,74 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
   void _onPaymentFailure(PaymentFailureResponse response) {
     if (!mounted) return;
     setState(() => _isPlacingOrder = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(response.message ?? 'Payment cancelled or failed'),
-      ),
+
+    final pendingId = _activePendingOrderId;
+    final pendingSnapshot = _activePendingSnapshot ?? _payableSnapshot;
+
+    if (pendingId != null && pendingId.isNotEmpty && pendingSnapshot != null) {
+      _showPendingOrderConfirmation(
+        orderId: pendingId,
+        snapshot: pendingSnapshot,
+      );
+    } else {
+      CustomAppSnackBar.showInfo(
+        context,
+        response.message ?? 'Payment cancelled or failed',
+      );
+    }
+  }
+
+  void _showPendingOrderConfirmation({
+    required String orderId,
+    required CheckoutPayableSnapshot snapshot,
+  }) {
+    if (!mounted) return;
+    final state = context.read<CartBloc>().state;
+    final displayAmt = snapshot.initiate.displayRupees > 0
+        ? snapshot.initiate.displayRupees
+        : (snapshot.gatewayAmountPaise / 100).round();
+
+    showPaymentPendingConfirmationSheet(
+      context,
+      orderId: orderId,
+      amountRupees: displayAmt,
+      onRetry: () {
+        _openRazorpayForSnapshot(snapshot, state);
+      },
+      onCancel: () async {
+        try {
+          final res = await _orderRepository.cancelPendingOrder(orderId);
+          final message =
+              res['message']?.toString() ?? 'Order cancelled successfully';
+          if (!mounted) return;
+          setState(() {
+            _activePendingOrderId = null;
+            _activePendingSnapshot = null;
+            _hasOpenedPayment = false;
+          });
+          // Refresh cart on cancel so reserved stock is freed
+          context.read<CartBloc>().refresh(source: 'CancelPendingOrder');
+          if (mounted && Navigator.canPop(context)) {
+            Navigator.pop(context);
+          }
+          CustomAppSnackBar.showSuccess(
+            context,
+            message,
+            title: 'Order Cancelled',
+          );
+        } on ApiException catch (e) {
+          if (!mounted) return;
+          CustomAppSnackBar.showError(context, e.message);
+          rethrow;
+        } catch (_) {
+          if (!mounted) return;
+          CustomAppSnackBar.showError(
+            context,
+            'Failed to cancel order. Please try again.',
+          );
+          rethrow;
+        }
+      },
     );
   }
 
@@ -179,6 +241,9 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     String? orderNumber,
     bool wasSubscriptionBooking = false,
   }) async {
+    _hasOpenedPayment = false;
+    _activePendingOrderId = null;
+    _activePendingSnapshot = null;
     if (kDebugMode) {
       debugPrint('[PAYMENT_FLOW] PAYMENT_SUCCESS');
     }
@@ -480,13 +545,10 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       if (!mounted) return;
       state = context.read<CartBloc>().state;
       if (!_canProceedToPaymentFor(state)) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              _payableError ??
-                  'Unable to refresh payment amount. Please try again.',
-            ),
-          ),
+        CustomAppSnackBar.showError(
+          context,
+          _payableError ??
+              'Unable to refresh payment amount. Please try again.',
         );
         return;
       }
@@ -507,9 +569,7 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
 
         if (!eligibility.canBookWithSubscription) {
           setState(() => _isPlacingOrder = false);
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(eligibility.unavailableMessage)),
-          );
+          CustomAppSnackBar.showError(context, eligibility.unavailableMessage);
           return;
         }
 
@@ -559,14 +619,11 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
         }
 
         setState(() => _isPlacingOrder = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              bookingResult.requiresPayment
-                  ? 'Payment details missing from server. Please try again.'
-                  : 'Unable to confirm wardrobe booking. Please try again.',
-            ),
-          ),
+        CustomAppSnackBar.showError(
+          context,
+          bookingResult.requiresPayment
+              ? 'Payment details missing from server. Please try again.'
+              : 'Unable to confirm wardrobe booking. Please try again.',
         );
         return;
       }
@@ -586,14 +643,11 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       if (!mounted) return;
       if (!freshInitiate.canOpenRazorpay) {
         setState(() => _isPlacingOrder = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              freshInitiate.requiresPayment
-                  ? 'Payment details missing from server. Please try again.'
-                  : 'Unable to start payment. Please try again.',
-            ),
-          ),
+        CustomAppSnackBar.showError(
+          context,
+          freshInitiate.requiresPayment
+              ? 'Payment details missing from server. Please try again.'
+              : 'Unable to start payment. Please try again.',
         );
         return;
       }
@@ -616,16 +670,13 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message)),
-      );
+      CustomAppSnackBar.showError(context, e.message);
     } catch (_) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Unable to place order. Please try again.'),
-        ),
+      CustomAppSnackBar.showError(
+        context,
+        'Unable to place order. Please try again.',
       );
     }
   }
@@ -634,6 +685,10 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     CheckoutPayableSnapshot snapshot,
     CartState state,
   ) async {
+    _hasOpenedPayment = true;
+    _activePendingSnapshot = snapshot;
+    _activePendingOrderId = snapshot.initiate.orderId;
+
     final result = snapshot.initiate;
     var customer = ProfileCache.instance.customer;
     if (customer == null) {
@@ -689,9 +744,28 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
         final subscriptionBooking = _isSubscriptionWardrobeBooking(state);
         final summary = _displaySummary(state);
 
-        return Scaffold(
-          backgroundColor: const Color(0xFF0F1012),
-          body: Stack(
+        return PopScope(
+          canPop: !_hasOpenedPayment ||
+              _activePendingOrderId == null ||
+              _activePendingOrderId!.isEmpty,
+          onPopInvokedWithResult: (didPop, result) {
+            if (didPop) return;
+            if (_hasOpenedPayment &&
+                _activePendingOrderId != null &&
+                _activePendingOrderId!.isNotEmpty) {
+              final pendingSnapshot =
+                  _activePendingSnapshot ?? _payableSnapshot;
+              if (pendingSnapshot != null) {
+                _showPendingOrderConfirmation(
+                  orderId: _activePendingOrderId!,
+                  snapshot: pendingSnapshot,
+                );
+              }
+            }
+          },
+          child: Scaffold(
+            backgroundColor: const Color(0xFF0F1012),
+            body: Stack(
             children: [
               AbsorbPointer(
                 absorbing: _isInteractionLocked,
@@ -760,29 +834,13 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
                   ),
                 ),
               ),
-              if (_isInteractionLocked) ...[
-                const Positioned.fill(
-                  child: ColoredBox(color: Color(0x55000000)),
-                ),
-                const Positioned.fill(
-                  child: Center(
-                    child: SizedBox(
-                      width: 28,
-                      height: 28,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.5,
-                        color: Color(0xFFE6C27A),
-                      ),
-                    ),
-                  ),
-                ),
-              ],
             ],
           ),
-        );
-      },
-    );
-  }
+        ),
+      );
+    },
+  );
+}
 
   Widget _buildAppBar() {
     return Container(
@@ -795,7 +853,22 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       child: Row(
         children: [
           GestureDetector(
-            onTap: () => Navigator.pop(context),
+            onTap: () {
+              if (_hasOpenedPayment &&
+                  _activePendingOrderId != null &&
+                  _activePendingOrderId!.isNotEmpty) {
+                final pendingSnapshot =
+                    _activePendingSnapshot ?? _payableSnapshot;
+                if (pendingSnapshot != null) {
+                  _showPendingOrderConfirmation(
+                    orderId: _activePendingOrderId!,
+                    snapshot: pendingSnapshot,
+                  );
+                  return;
+                }
+              }
+              Navigator.pop(context);
+            },
             child: Icon(Icons.arrow_back, color: AppColours.primary, size: 20),
           ),
           Expanded(
@@ -1516,7 +1589,7 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     return Container(
       width: double.maxFinite,
       margin: EdgeInsets.fromLTRB(16.w, 0, 16.w, 14.h),
-      height: 56.h,
+      height: 44.h,
       child: ElevatedButton(
         onPressed: paymentReady && !_isPlacingOrder
             ? () => _placeOrder(state)

@@ -1,4 +1,4 @@
-package com.example.nomowear
+package com.nomowear
 
 import android.os.Build
 import android.os.Bundle

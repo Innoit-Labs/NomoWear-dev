@@ -235,7 +235,7 @@ class _OtpScreenState extends State<OtpScreen> {
   Widget _buildVerifyButton(BuildContext context, OtpState state) {
     return SizedBox(
       width: double.maxFinite,
-      height: 60.h,
+      height: 44.h,
       child: ElevatedButton(
         style: ElevatedButton.styleFrom(
           backgroundColor: AppColours.primary,

@@ -216,8 +216,9 @@ class _SelectAddressScreenState extends State<SelectAddressScreen> {
                       children: [
                         TileLayer(
                           urlTemplate:
-                              'https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png',
+                              'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                           userAgentPackageName: 'com.example.nomowear',
+                          tileBuilder: darkModeTileBuilder,
                         ),
                       ],
                     ),
@@ -427,7 +428,7 @@ class _SelectAddressScreenState extends State<SelectAddressScreen> {
           SizedBox(height: 18.h),
           SizedBox(
             width: double.infinity,
-            height: 50.h,
+            height: 44.h,
             child: DecoratedBox(
               decoration: BoxDecoration(
                 borderRadius: BorderRadius.circular(12),

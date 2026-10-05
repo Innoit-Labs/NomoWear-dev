@@ -132,72 +132,216 @@ class _OrderTrackingScreenState extends State<OrderTrackingScreen> {
     return AppColours.primary;
   }
 
-  List<_TrackingStepData> get _trackingSteps {
+  List<_TrackingStepData> get _deliveryTrackingSteps {
     final order = _order;
     if (order == null) return const [];
 
     final config = order.orderStatusConfig;
-    if (config.isEmpty) {
-      return order.statusHistory
-          .map(
-            (entry) => _TrackingStepData(
-              title: entry.status.toUpperCase(),
-              subtitle: UserOrderMapper.formatTrackingTimestamp(entry.timestamp),
-              isCompleted: true,
-              isCurrent: entry.status.toUpperCase() ==
-                  order.normalizedOrderStatus,
-            ),
-          )
+    var deliveryConfig = config
+        .where((item) => !UserOrderMapper.isReturnTimelineStatus(item.status))
+        .toList(growable: false);
+
+    if (deliveryConfig.isEmpty) {
+      final historyDelivery = order.statusHistory
+          .where((entry) => !UserOrderMapper.isReturnTimelineStatus(entry.status))
           .toList();
+      if (historyDelivery.isNotEmpty) {
+        return historyDelivery
+            .map(
+              (entry) => _TrackingStepData(
+                title: entry.status.toUpperCase(),
+                subtitle: UserOrderMapper.formatTrackingTimestamp(entry.timestamp),
+                isCompleted: true,
+                isCurrent: entry.status.toUpperCase() ==
+                    order.normalizedOrderStatus,
+              ),
+            )
+            .toList();
+      }
+      deliveryConfig = const [
+        OrderStatusConfigItem(status: 'PENDING', label: 'Order Placed'),
+        OrderStatusConfigItem(status: 'CONFIRMED', label: 'Order Confirmed'),
+        OrderStatusConfigItem(status: 'PROCESSING', label: 'Processing'),
+        OrderStatusConfigItem(status: 'DISPATCHED', label: 'Dispatched'),
+        OrderStatusConfigItem(status: 'DELIVERED', label: 'Delivered'),
+      ];
     }
 
-    final historyHasReturn = order.statusHistory.any(
-      (entry) => UserOrderMapper.isReturnTimelineStatus(entry.status),
-    );
-    // Show return timeline only after admin approval / real return flow —
-    // not for waitlisted/pending return requests.
-    final showReturnSteps =
-        order.shouldShowReturnTimeline || historyHasReturn;
-
-    final visibleConfig = config.where((item) {
-      final status = item.status.trim().toUpperCase();
-      if (UserOrderMapper.isReturnTimelineStatus(status)) {
-        return showReturnSteps;
-      }
-      return true;
-    }).toList(growable: false);
-
-    final currentStatus = order.trackingCurrentStatus;
-    final currentIndex = visibleConfig.indexWhere(
+    final currentStatus = order.normalizedOrderStatus;
+    final currentIndex = deliveryConfig.indexWhere(
       (item) => item.status.trim().toUpperCase() == currentStatus,
     );
 
     final historyByStatus = order.trackingTimestampsByStatus;
-    final inReturnTimeline = showReturnSteps;
+    final isDelivered = order.isDelivered;
 
-    return visibleConfig.asMap().entries.map((entry) {
+    return deliveryConfig.asMap().entries.map((entry) {
+      final index = entry.key;
+      final item = entry.value;
+      final normalized = item.status.trim().toUpperCase();
+      final timestamp = historyByStatus[normalized];
+      final isCompleted = timestamp != null ||
+          isDelivered ||
+          (currentIndex >= 0 && index < currentIndex) ||
+          (normalized == 'DELIVERED' && isDelivered);
+      final isCurrent = !isDelivered && (currentIndex == index);
+
+      return _TrackingStepData(
+        title: item.label.toUpperCase(),
+        subtitle: timestamp != null
+            ? UserOrderMapper.formatTrackingTimestamp(timestamp)
+            : (isCompleted
+                ? 'Completed'
+                : (isCurrent ? 'In progress' : 'Pending')),
+        isCompleted: isCompleted,
+        isCurrent: isCurrent,
+      );
+    }).toList();
+  }
+
+  List<_TrackingStepData> get _returnTrackingSteps {
+    final order = _order;
+    if (order == null) return const [];
+
+    int returnStatusRank(String status) {
+      final s = status.trim().toUpperCase();
+      if (s == 'RETURN_REQUESTED' ||
+          s == 'RETURN_PENDING' ||
+          s == 'PICKUP_SCHEDULED') {
+        return 1;
+      }
+      if (s == 'APPROVED' || s == 'RETURN_APPROVED') {
+        return 2;
+      }
+      if (s == 'RETURNED' || s == 'RETURNED_TO_IAP') {
+        return 3;
+      }
+      return 4;
+    }
+
+    final config = order.orderStatusConfig;
+    var returnConfig = config
+        .where((item) => UserOrderMapper.isReturnTimelineStatus(item.status))
+        .toList();
+
+    if (returnConfig.isEmpty) {
+      final historyReturn = order.statusHistory
+          .where((entry) => UserOrderMapper.isReturnTimelineStatus(entry.status))
+          .toList();
+      if (historyReturn.isNotEmpty) {
+        returnConfig = historyReturn
+            .map(
+              (entry) => OrderStatusConfigItem(
+                status: entry.status.toUpperCase(),
+                label: entry.status.toUpperCase().replaceAll('_', ' '),
+              ),
+            )
+            .toList();
+      } else {
+        returnConfig = const [
+          OrderStatusConfigItem(
+            status: 'RETURN_REQUESTED',
+            label: 'RETURN REQUESTED',
+          ),
+          OrderStatusConfigItem(
+            status: 'APPROVED',
+            label: 'APPROVED',
+          ),
+          OrderStatusConfigItem(
+            status: 'RETURNED',
+            label: 'RETURNED',
+          ),
+        ];
+      }
+    }
+
+    // Ensure the return steps are strictly in the order:
+    // 1. RETURN_REQUESTED
+    // 2. APPROVED
+    // 3. RETURNED
+    returnConfig.sort(
+      (a, b) => returnStatusRank(a.status).compareTo(returnStatusRank(b.status)),
+    );
+
+    final historyByStatus = order.trackingTimestampsByStatus;
+    final returnStatus = order.returnStatus?.trim().toUpperCase() ?? '';
+    final orderStatus = order.normalizedOrderStatus;
+
+    final isFinalReturnDone = order.returnedAt != null ||
+        returnStatus == 'RETURNED' ||
+        returnStatus == 'RETURNED_TO_IAP' ||
+        orderStatus == 'RETURNED' ||
+        orderStatus == 'RETURNED_TO_IAP';
+
+    int currentReturnIndex = -1;
+    if (isFinalReturnDone) {
+      currentReturnIndex = returnConfig.indexWhere((item) {
+        final s = item.status.trim().toUpperCase();
+        return s == 'RETURNED' || s == 'RETURNED_TO_IAP';
+      });
+    } else if (returnStatus == 'APPROVED' ||
+        returnStatus == 'RETURN_APPROVED' ||
+        orderStatus == 'APPROVED' ||
+        orderStatus == 'RETURN_APPROVED') {
+      currentReturnIndex = returnConfig.indexWhere((item) {
+        final s = item.status.trim().toUpperCase();
+        return s == 'APPROVED' || s == 'RETURN_APPROVED';
+      });
+    } else if (returnStatus == 'RETURN_REQUESTED' ||
+        returnStatus == 'RETURN_PENDING' ||
+        returnStatus == 'PICKUP_SCHEDULED' ||
+        orderStatus == 'RETURN_REQUESTED' ||
+        order.isInReturnFlow ||
+        PendingReturnStore.instance.contains(order.id)) {
+      currentReturnIndex = returnConfig.indexWhere((item) {
+        final s = item.status.trim().toUpperCase();
+        return s == 'RETURN_REQUESTED' ||
+            s == 'RETURN_PENDING' ||
+            s == 'PICKUP_SCHEDULED';
+      });
+    }
+
+    if (currentReturnIndex < 0 && !isFinalReturnDone) {
+      for (int i = returnConfig.length - 1; i >= 0; i--) {
+        final s = returnConfig[i].status.trim().toUpperCase();
+        if (historyByStatus.containsKey(s) ||
+            (s == 'APPROVED' && historyByStatus.containsKey('RETURN_APPROVED')) ||
+            (s == 'RETURN_APPROVED' && historyByStatus.containsKey('APPROVED')) ||
+            (s == 'RETURNED' && historyByStatus.containsKey('RETURNED_TO_IAP'))) {
+          currentReturnIndex = i;
+          break;
+        }
+      }
+    }
+
+    return returnConfig.asMap().entries.map((entry) {
       final index = entry.key;
       final item = entry.value;
       final normalized = item.status.trim().toUpperCase();
       final timestamp = historyByStatus[normalized] ??
           (normalized == 'APPROVED'
               ? historyByStatus['RETURN_APPROVED']
-              : null);
+              : (normalized == 'RETURN_APPROVED'
+                  ? historyByStatus['APPROVED']
+                  : (normalized == 'RETURNED'
+                      ? historyByStatus['RETURNED_TO_IAP']
+                      : null)));
+
       final isCompleted = timestamp != null ||
-          (currentIndex >= 0 && index < currentIndex) ||
-          (normalized == 'DELIVERED' && order.isDelivered) ||
-          (normalized == 'COMPLETED' && order.isDelivered) ||
-          (normalized == 'RETURN_REQUESTED' &&
-              inReturnTimeline &&
-              currentIndex > index);
-      final isCurrent = normalized == currentStatus &&
-          (inReturnTimeline || !order.isDelivered);
+          isFinalReturnDone ||
+          (currentReturnIndex >= 0 && index < currentReturnIndex);
+
+      final isCurrent = !isFinalReturnDone &&
+          !isCompleted &&
+          (currentReturnIndex == index);
 
       return _TrackingStepData(
         title: item.label.toUpperCase(),
         subtitle: timestamp != null
             ? UserOrderMapper.formatTrackingTimestamp(timestamp)
-            : (isCurrent ? 'In progress' : 'Pending'),
+            : (isCompleted
+                ? 'Completed'
+                : (isCurrent ? 'In progress' : 'Pending')),
         isCompleted: isCompleted,
         isCurrent: isCurrent,
       );
@@ -290,7 +434,8 @@ class _OrderTrackingScreenState extends State<OrderTrackingScreen> {
       );
     }
 
-    final steps = _trackingSteps;
+    final deliverySteps = _deliveryTrackingSteps;
+    final returnSteps = _returnTrackingSteps;
 
     return SingleChildScrollView(
       padding: EdgeInsets.symmetric(horizontal: 24.w, vertical: 24.h),
@@ -373,15 +518,38 @@ class _OrderTrackingScreenState extends State<OrderTrackingScreen> {
             ),
           ),
           SizedBox(height: 32.h),
-          ...steps.asMap().entries.map(
+          ...deliverySteps.asMap().entries.map(
             (entry) => _buildTrackingStep(
               title: entry.value.title,
               subtitle: entry.value.subtitle,
               isCompleted: entry.value.isCompleted,
               isCurrent: entry.value.isCurrent,
-              isLast: entry.key == steps.length - 1,
+              isLast: entry.key == deliverySteps.length - 1,
             ),
           ),
+          if (returnSteps.isNotEmpty) ...[
+            SizedBox(height: 24.h),
+            Divider(color: AppColours.primary, thickness: 0.2),
+            SizedBox(height: 24.h),
+            Text(
+              'RETURN ORDER TRACKING',
+              style: CustomTextStyles.montserratBold.copyWith(
+                color: AppColours.primary,
+                fontSize: 14.fSize,
+                letterSpacing: 2.0,
+              ),
+            ),
+            SizedBox(height: 32.h),
+            ...returnSteps.asMap().entries.map(
+              (entry) => _buildTrackingStep(
+                title: entry.value.title,
+                subtitle: entry.value.subtitle,
+                isCompleted: entry.value.isCompleted,
+                isCurrent: entry.value.isCurrent,
+                isLast: entry.key == returnSteps.length - 1,
+              ),
+            ),
+          ],
           SizedBox(height: 24.h),
           Divider(color: AppColours.primary, thickness: 0.2),
           SizedBox(height: 32.h),

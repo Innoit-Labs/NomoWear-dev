@@ -1,3 +1,5 @@
+import 'package:nomowear/features/profile/domain/order_action.dart';
+
 /// Single garment line inside a kit / multi-item order (order details).
 class OrderLineItem {
   final String productId;
@@ -54,7 +56,35 @@ class UserOrder {
   final bool isWardrobeKit;
   final int totalGarmentsCount;
   final String? deliveryDateFormatted;
+  final DateTime? deliveryDate;
   final num totalAmount;
+  final String? invoiceNumber;
+  final String? orderType;
+  final String? paymentStatus;
+  final String? paymentMethod;
+  final num subtotal;
+  final num deliveryCharge;
+  final num taxAmount;
+  final num discountAmount;
+  final num securityDepositAmount;
+  final String? securityDepositRefundStatus;
+  final num securityDepositRefundAmount;
+  final String? transactionId;
+  final DateTime? createdAt;
+  final String? deliveryTime;
+  final String? orderStatusRaw;
+  final num kitPrice;
+  final String? pickupDate;
+  final String? pickupTime;
+  final String? pickupNote;
+  final String? pickupMobile;
+  final String? pickupFullName;
+  final String actionLabel;
+  final bool actionEnabled;
+  final OrderActionFlow actionFlow;
+  final String? returnStatus;
+  final int? daysLeft;
+  final String? customerAddressId;
 
   const UserOrder({
     required this.id,
@@ -76,8 +106,43 @@ class UserOrder {
     this.isWardrobeKit = false,
     this.totalGarmentsCount = 0,
     this.deliveryDateFormatted,
+    this.deliveryDate,
     this.totalAmount = 0,
+    this.invoiceNumber,
+    this.orderType,
+    this.paymentStatus,
+    this.paymentMethod,
+    this.subtotal = 0,
+    this.deliveryCharge = 0,
+    this.taxAmount = 0,
+    this.discountAmount = 0,
+    this.securityDepositAmount = 0,
+    this.securityDepositRefundStatus,
+    this.securityDepositRefundAmount = 0,
+    this.transactionId,
+    this.createdAt,
+    this.deliveryTime,
+    this.orderStatusRaw,
+    this.kitPrice = 0,
+    this.pickupDate,
+    this.pickupTime,
+    this.pickupNote,
+    this.pickupMobile,
+    this.pickupFullName,
+    this.actionLabel = 'Track Your Order',
+    this.actionEnabled = true,
+    this.actionFlow = OrderActionFlow.forward,
+    this.returnStatus,
+    this.daysLeft,
+    this.customerAddressId,
+    this.hasReturnFailed = false,
+    this.canReattemptReturn = false,
+    this.rejectionReason,
   });
+
+  final bool hasReturnFailed;
+  final bool canReattemptReturn;
+  final String? rejectionReason;
 
   bool get hasLineItems => lineItems != null && lineItems!.isNotEmpty;
 
@@ -110,6 +175,15 @@ class UserOrder {
     int? totalGarmentsCount,
     String? deliveryDateFormatted,
     num? totalAmount,
+    bool? hasReturnFailed,
+    bool? canReattemptReturn,
+    String? rejectionReason,
+    String? actionLabel,
+    bool? actionEnabled,
+    OrderActionFlow? actionFlow,
+    String? returnStatus,
+    int? daysLeft,
+    String? customerAddressId,
   }) {
     return UserOrder(
       id: id ?? this.id,
@@ -133,6 +207,20 @@ class UserOrder {
       totalGarmentsCount: totalGarmentsCount ?? this.totalGarmentsCount,
       deliveryDateFormatted: deliveryDateFormatted ?? this.deliveryDateFormatted,
       totalAmount: totalAmount ?? this.totalAmount,
+      hasReturnFailed: hasReturnFailed ?? this.hasReturnFailed,
+      canReattemptReturn: canReattemptReturn ?? this.canReattemptReturn,
+      rejectionReason: rejectionReason ?? this.rejectionReason,
+      actionLabel: actionLabel ?? this.actionLabel,
+      actionEnabled: actionEnabled ?? this.actionEnabled,
+      actionFlow: actionFlow ?? this.actionFlow,
+      returnStatus: returnStatus ?? this.returnStatus,
+      daysLeft: daysLeft ?? this.daysLeft,
+      customerAddressId: customerAddressId ?? this.customerAddressId,
+      pickupDate: pickupDate,
+      pickupTime: pickupTime,
+      pickupNote: pickupNote,
+      pickupMobile: pickupMobile,
+      pickupFullName: pickupFullName,
     );
   }
 }
@@ -179,5 +267,8 @@ void markUserOrderReturnSubmitted(String orderId) {
     deliveredSummaryShowsReturn: false,
     statusLabel: 'Return status',
     statusDate: 'Pending approval',
+    actionLabel: OrderActionDecision.trackReturn.label,
+    actionEnabled: true,
+    actionFlow: OrderActionFlow.reverse,
   );
 }

@@ -215,6 +215,43 @@ class EssentialsBannerShimmer extends StatelessWidget {
   }
 }
 
+class HomeScreenShimmer extends StatelessWidget {
+  const HomeScreenShimmer({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.symmetric(horizontal: 20.w),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(height: 20.h),
+          const HomeHeaderShimmer(),
+          SizedBox(height: 16.h),
+          AppShimmer(
+            child: AppShimmer.box(
+              width: double.infinity,
+              height: 2,
+              borderRadius: 1,
+            ),
+          ),
+          SizedBox(height: 16.h),
+          const BannerShimmer(),
+          SizedBox(height: 32.h),
+          AppShimmer(
+            child: AppShimmer.box(width: 210.w, height: 22.h, borderRadius: 6),
+          ),
+          SizedBox(height: 20.h),
+          const WardrobeGridShimmer(rows: 2),
+          SizedBox(height: 24.h),
+          const EssentialsBannerShimmer(),
+          SizedBox(height: 40.h),
+        ],
+      ),
+    );
+  }
+}
+
 class ProfileCardShimmer extends StatelessWidget {
   const ProfileCardShimmer({super.key});
 

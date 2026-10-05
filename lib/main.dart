@@ -1,8 +1,10 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/services/app_version_gate.dart';
 import 'package:nomowear/core/services/auth_storage.dart';
+import 'package:nomowear/core/services/firebase_messaging_service.dart';
 import 'package:nomowear/features/auth/presentation/screens/splash_screen.dart';
 import 'package:nomowear/features/cart/presentation/bloc/cart_bloc.dart';
 import 'package:nomowear/features/checkout/data/subscription_kit_preferences.dart';
@@ -14,6 +16,14 @@ const Color _splashBackground = Color(0xFF0F1012);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Firebase and Cloud Messaging
+  try {
+    await Firebase.initializeApp();
+    await FirebaseMessagingService.instance.initialize();
+  } catch (e) {
+    debugPrint('Firebase initialization failed: $e');
+  }
 
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
@@ -54,6 +64,7 @@ class MyApp extends StatelessWidget {
       child: Sizer(
         builder: (context, orientation, deviceType) {
           return MaterialApp(
+            scaffoldMessengerKey: CustomAppSnackBar.scaffoldMessengerKey,
             theme: ThemeHelper.themeDataData,
             title: 'nomowear',
             debugShowCheckedModeBanner: false,

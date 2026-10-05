@@ -8,7 +8,7 @@ import 'package:nomowear/features/home/presentation/screens/home_screen.dart';
 import 'package:nomowear/features/notifications/presentation/screens/notifications_screen.dart';
 import 'package:nomowear/features/categories/presentation/screens/categories_screen.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
-import 'package:nomowear/features/auth/presentation/screens/screenshot_screen.dart';
+import 'package:nomowear/features/auth/presentation/screens/choose_your_wardrobe_kit_screen.dart';
 import 'package:nomowear/features/auth/presentation/screens/add_new_address_screen.dart';
 import 'package:nomowear/features/auth/presentation/screens/select_address_screen.dart';
 import 'package:nomowear/features/profile/presentation/screens/membership_purchase_screen.dart';
@@ -45,7 +45,8 @@ class AppRoutes {
   static const String notificationsScreen = '/notifications_screen';
   static const String categoriesScreen = '/categories_screen';
   static const String wardrobeScreen = '/wardrobe_screen';
-  static const String screenshotScreen = '/screenshot_screen';
+  static const String chooseYourWardrobeKitScreen = '/choose_your_wardrobe_kit_screen';
+  static const String screenshotScreen = chooseYourWardrobeKitScreen;
   static const String addNewAddressScreen = '/add_new_address_screen';
   static const String selectAddressScreen = '/select_address_screen';
   static const String membershipPurchaseScreen = '/membership_purchase_screen';
@@ -105,10 +106,10 @@ class AppRoutes {
           ModalRoute.of(context)!.settings.arguments as String? ?? '';
       return WardrobeScreen(category: category);
     },
-    screenshotScreen: (context) {
+    chooseYourWardrobeKitScreen: (context) {
       final category =
           ModalRoute.of(context)!.settings.arguments as String? ?? '';
-      return ScreenshotScreen(wardrobeCategory: category);
+      return ChooseYourWardrobeKitScreen(wardrobeCategory: category);
     },
     addNewAddressScreen: (context) {
       final args = ModalRoute.of(context)?.settings.arguments;
@@ -235,7 +236,7 @@ class AppRoutes {
     },
     returnOrderScreen: (context) {
       final args = ModalRoute.of(context)?.settings.arguments;
-      if (args is Map<String, dynamic>) {
+      if (args is Map) {
         return ReturnOrderScreen(
           orderId: args['orderId']?.toString() ?? '',
           orderNumber: args['orderNumber']?.toString(),

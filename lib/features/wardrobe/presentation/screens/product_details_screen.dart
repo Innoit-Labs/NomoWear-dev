@@ -3,9 +3,11 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/utils/api_id_utils.dart';
+import 'package:nomowear/core/utils/kids_size_utils.dart';
 import 'package:nomowear/features/products/data/product_mapper.dart';
 import 'package:nomowear/features/products/data/product_repository.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
+import 'package:nomowear/features/products/data/product_catalog.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
 import 'package:nomowear/features/cart/presentation/bloc/cart_bloc.dart';
 import 'package:nomowear/features/cart/presentation/utils/cart_limits.dart';
@@ -53,13 +55,19 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
     if (_product.genderTag == 'boy' || _product.genderTag == 'girl') {
       return true;
     }
-    // Infer from variant size labels like 0-3M / 2-4Y.
+    final title = _product.title.toLowerCase();
+    if (RegExp(r'\b(kids?|boys?|girls?)\b').hasMatch(title)) {
+      return true;
+    }
+    // Infer from variant size labels like 0-3M / 2-4Y or kids age sizes.
     for (final variant in _product.variants) {
       final size = _variantOptionValue(variant.options, 'Size');
-      if (size != null && _looksLikeKidsAgeSize(size)) return true;
+      if (size != null && (isKidsAgeSize(size) || _looksLikeKidsAgeSize(size))) {
+        return true;
+      }
     }
     for (final size in _product.sizes) {
-      if (_looksLikeKidsAgeSize(size)) return true;
+      if (isKidsAgeSize(size) || _looksLikeKidsAgeSize(size)) return true;
     }
     return false;
   }
@@ -171,7 +179,7 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
 
   int _compareSizes(String a, String b) {
     if (_isKidsProduct) {
-      return a.toUpperCase().compareTo(b.toUpperCase());
+      return compareKidsSizes(a, b);
     }
     final ai = _adultSizeOrder.indexOf(a.toUpperCase());
     final bi = _adultSizeOrder.indexOf(b.toUpperCase());
@@ -261,7 +269,12 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
         _loadedProduct = mapped;
         final loadedSizes = _sizes;
         if (loadedSizes.isNotEmpty) {
-          _selectedSize = loadedSizes.first;
+          final stillMatches = loadedSizes.any((s) => _isKidsProduct
+              ? areKidsSizesEquivalent(s, _selectedSize)
+              : s.toUpperCase() == _selectedSize.toUpperCase());
+          if (!stillMatches) {
+            _selectedSize = loadedSizes.first;
+          }
         }
         _isLoadingDetails = false;
       });
@@ -278,9 +291,6 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
         : _product.imageUrl;
     final variant = _selectedVariant;
     final productId = _product.productId;
-    final cartId = variant != null && isApiUuid(productId) && isApiUuid(variant.id)
-        ? '${productId}_${variant.id}'
-        : (productId ?? _favoriteId);
     final prices = ProductMapper.resolvePrice(_product, variant: variant);
     final price = prices.discountedPrice;
 
@@ -295,14 +305,18 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
         ? 'kids'
         : (isEssential ? 'essentials' : itemType);
 
+    // Let CartItem build the canonical line id (product_variant_type) so pending
+    // checks and CartBloc keys stay in sync with Product ↔ Cart screens.
+    final displaySelectedSize =
+        isKids ? formatKidsSize(_selectedSize) : _selectedSize;
+
     return CartItem(
-      id: cartId,
       productId: productId ?? _favoriteId,
       variantId: isApiUuid(variant?.id) ? variant!.id : null,
       title: _product.title,
       imageUrl: selectedImage,
       price: price,
-      selectedSize: _selectedSize,
+      selectedSize: displaySelectedSize,
       isEssential: isEssential,
       isKids: isKids,
       isSubscriptionGarment: !isEssential && effectiveItemType == 'subscription',
@@ -369,8 +383,10 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
                         _buildImageCarousel(),
                         SizedBox(height: 16.h),
                         _buildTitleRow(),
-                        SizedBox(height: 6.h),
-                        _buildPriceSection(),
+                        if (_shouldShowPrice) ...[
+                          SizedBox(height: 6.h),
+                          _buildPriceSection(),
+                        ],
                         SizedBox(height: 8.h),
                         _buildDescription(),
                         SizedBox(height: 20.h),
@@ -651,7 +667,11 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
     );
   }
 
+  bool get _shouldShowPrice =>
+      ProductCatalog.shouldShowPrice(category: _product.category);
+
   Widget _buildPriceSection() {
+    if (!_shouldShowPrice) return const SizedBox.shrink();
     final prices = ProductMapper.resolvePrice(_product, variant: _selectedVariant);
 
     if (prices.hasDiscount) {
@@ -821,8 +841,11 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
     final isAvailable = _isKidsProduct
         ? true
         : _sizes.map((s) => s.toUpperCase()).contains(size.toUpperCase());
-    final isActive = _selectedSize.toUpperCase() == size.toUpperCase();
-    final isCompact = _isAdultLetterSize(size);
+    final isActive = _isKidsProduct
+        ? areKidsSizesEquivalent(_selectedSize, size)
+        : _selectedSize.toUpperCase() == size.toUpperCase();
+    final isCompact = !_isKidsProduct && _isAdultLetterSize(size);
+    final displayLabel = _isKidsProduct ? formatKidsSize(size) : size;
 
     return GestureDetector(
       onTap: isAvailable ? () => setState(() => _selectedSize = size) : null,
@@ -842,7 +865,7 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
           ),
         ),
         child: Text(
-          size,
+          displayLabel,
           style: TextStyle(
             color: isActive
                 ? Colors.black
@@ -1057,22 +1080,13 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
                               Expanded(
                                 flex: 2,
                                 child: Center(
-                                  child: pending
-                                      ? const SizedBox(
-                                          width: 18,
-                                          height: 18,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                            color: Color(0xFFE6C27A),
-                                          ),
-                                        )
-                                      : Text(
-                                          '$qty',
-                                          style: CustomTextStyles.montserratBold.copyWith(
-                                            fontSize: 16,
-                                            color: AppColours.primary,
-                                          ),
-                                        ),
+                                  child: Text(
+                                    '$qty',
+                                    style: CustomTextStyles.montserratBold.copyWith(
+                                      fontSize: 16,
+                                      color: AppColours.primary,
+                                    ),
+                                  ),
                                 ),
                               ),
                               Container(width: 1, color: AppColours.primary.withOpacity(0.35)),
@@ -1128,7 +1142,7 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
                     onPressed: showOutOfStock
                         ? null
                         : () {
-                      final added = tryAddToCart(context, cartItem);
+                      final added = tryAddToCart(context, syncedCartItem);
                       if (!added) return;
 
                       Navigator.pushNamedAndRemoveUntil(

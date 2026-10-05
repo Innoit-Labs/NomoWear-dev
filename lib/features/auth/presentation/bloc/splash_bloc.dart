@@ -1,7 +1,10 @@
+import 'dart:async';
+
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/services/app_version_gate.dart';
 import 'package:nomowear/core/services/auth_storage.dart';
+import 'package:nomowear/core/services/firebase_messaging_service.dart';
 import 'package:nomowear/core/services/session_cleanup.dart';
 import 'package:nomowear/features/auth/presentation/bloc/splash_event.dart';
 import 'package:nomowear/features/auth/presentation/bloc/splash_state.dart';
@@ -41,6 +44,7 @@ class SplashBloc extends Bloc<SplashEvent, SplashState> {
       final isLoggedIn = await _authStorage.isLoggedIn();
       if (isLoggedIn) {
         destination = SplashDestination.home;
+        unawaited(FirebaseMessagingService.instance.sendTokenToServer());
         try {
           await _profileRepository.getProfile(forceRefresh: true);
         } on ApiException catch (e) {
