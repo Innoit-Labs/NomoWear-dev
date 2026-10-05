@@ -7,5 +7,6 @@ export 'package:nomowear/routes/app_routes.dart';
 export 'package:nomowear/core/widgets/app_logo.dart';
 export 'package:nomowear/core/widgets/shimmer_loading.dart';
 export 'package:nomowear/core/widgets/product_image.dart';
+export 'package:nomowear/core/widgets/custom_app_snack_bar.dart';
 export 'package:flutter/material.dart';
 export 'package:flutter_bloc/flutter_bloc.dart';

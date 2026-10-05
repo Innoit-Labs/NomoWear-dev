@@ -14,8 +14,10 @@ import 'package:nomowear/features/checkout/data/checkout_session.dart';
 import 'package:nomowear/features/checkout/data/subscription_kit_preferences.dart';
 import 'package:nomowear/features/checkout/data/wardrobe_booking_session.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
+import 'package:nomowear/features/products/data/product_catalog.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
 import 'package:nomowear/features/products/data/product_mapper.dart';
+import 'package:nomowear/features/products/data/product_repository.dart';
 
 void _cartLog(String message) {
   if (kDebugMode) debugPrint('[CART] $message');
@@ -238,6 +240,7 @@ class SetWardrobeKitEvent extends CartEvent {
   SetWardrobeKitEvent({
     required this.kitId,
     this.wardrobeKitProductId,
+    this.wardrobeKitVariantId,
     required this.kitDays,
     required this.kitName,
     required this.maxGarments,
@@ -247,6 +250,7 @@ class SetWardrobeKitEvent extends CartEvent {
   });
   final String kitId;
   final String? wardrobeKitProductId;
+  final String? wardrobeKitVariantId;
   final int kitDays;
   final String kitName;
   final int maxGarments;
@@ -273,6 +277,7 @@ class CartState extends Equatable {
     this.wardrobeKitDays = 1,
     this.wardrobeKitId,
     this.wardrobeKitProductId,
+    this.wardrobeKitVariantId,
     this.wardrobeKitName = '',
     this.wardrobeKitMaxGarments = 0,
     this.wardrobeKitPrice,
@@ -289,6 +294,7 @@ class CartState extends Equatable {
   final int wardrobeKitDays;
   final String? wardrobeKitId;
   final String? wardrobeKitProductId;
+  final String? wardrobeKitVariantId;
   final String wardrobeKitName;
   final int wardrobeKitMaxGarments;
   final String? wardrobeKitPrice;
@@ -380,8 +386,10 @@ class CartState extends Equatable {
       ? wardrobeKitName
       : '$wardrobeKitDays Day wardrobe kit';
 
-  bool get isEmpty => items.isEmpty && remote.itemCount <= 0;
-  bool get isConfirmedEmpty => status == CartStatus.loaded && isEmpty;
+  bool get isEmpty => items.isEmpty;
+  bool get isConfirmedEmpty =>
+      (status == CartStatus.loaded || status == CartStatus.updating) &&
+      items.isEmpty;
   bool get isSyncing =>
       status == CartStatus.loading || status == CartStatus.updating;
   bool get hasLoadedRemote =>
@@ -518,6 +526,7 @@ class CartState extends Equatable {
     int? wardrobeKitDays,
     String? wardrobeKitId,
     String? wardrobeKitProductId,
+    String? wardrobeKitVariantId,
     String? wardrobeKitName,
     int? wardrobeKitMaxGarments,
     String? wardrobeKitPrice,
@@ -539,6 +548,9 @@ class CartState extends Equatable {
       wardrobeKitProductId: clearWardrobeKit
           ? null
           : wardrobeKitProductId ?? this.wardrobeKitProductId,
+      wardrobeKitVariantId: clearWardrobeKit
+          ? null
+          : wardrobeKitVariantId ?? this.wardrobeKitVariantId,
       wardrobeKitName:
           clearWardrobeKit ? '' : wardrobeKitName ?? this.wardrobeKitName,
       wardrobeKitMaxGarments: clearWardrobeKit
@@ -562,6 +574,8 @@ class CartState extends Equatable {
         remote.id,
         errorMessage,
         wardrobeKitId,
+        wardrobeKitProductId,
+        wardrobeKitVariantId,
         wardrobeKitDays,
         wardrobeCategory,
         pendingLineIds.join(','),
@@ -590,6 +604,7 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       emit(state.copyWith(
         wardrobeKitId: event.kitId,
         wardrobeKitProductId: event.wardrobeKitProductId,
+        wardrobeKitVariantId: event.wardrobeKitVariantId,
         wardrobeKitDays: event.kitDays,
         wardrobeKitName: event.kitName,
         wardrobeKitMaxGarments: event.maxGarments,
@@ -610,12 +625,34 @@ class CartBloc extends Bloc<CartEvent, CartState> {
 
   final CartRepository _repository;
   Future<void> _ops = Future.value();
+  /// Bumped at the *start* of every cart write/GET that may apply remote state.
+  /// Completing ops with an older id must not overwrite newer results.
+  int _writeGeneration = 0;
   int _latestApplyId = 0;
   final Map<String, Future<void>> _lineOps = {};
   final Set<String> _inflightLines = {};
   final Set<String> _qtyFlushing = {};
   final Map<String, int> _desiredQty = {};
+  final Map<String, int> _serverQty = {};
+  final Map<String, CartItem> _lastKnownItems = {};
   final List<Completer<RemoteCart>> _refreshWaiters = [];
+
+  bool _isKitItemType(String type) =>
+      type == 'subscription' || type == 'non_subscription';
+
+  Future<void> _enqueueWrite(
+    String lineKey,
+    String itemType,
+    Future<void> Function() action,
+  ) async {
+    // Wardrobe kit POSTs rewrite the whole kit — must be global, not per-line,
+    // or parallel removes race and a slower response resurrects deleted items.
+    if (_isKitItemType(itemType)) {
+      await _enqueue(action);
+    } else {
+      await _enqueueLine(lineKey, action);
+    }
+  }
 
   Future<void> _enqueue(Future<void> Function() action) async {
     final previous = _ops;
@@ -664,10 +701,13 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       _addUiLog('CLEAR LOADING already-clear productKey=$lineId');
       return;
     }
-    _addUiLog('CLEAR LOADING productKey=$lineId');
+    final remainingPending = _pendingMinus(lineId);
     _emitLogged(
       emit,
-      state.copyWith(pendingLineIds: _pendingMinus(lineId)),
+      state.copyWith(
+        status: remainingPending.isEmpty ? CartStatus.loaded : CartStatus.updating,
+        pendingLineIds: remainingPending,
+      ),
       source,
     );
   }
@@ -711,9 +751,9 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     int? expectedApplyId,
     String? clearLineId,
   }) async {
-    if (expectedApplyId != null && expectedApplyId != _latestApplyId) {
+    if (expectedApplyId != null && expectedApplyId != _writeGeneration) {
       _perf(
-        'SKIP STALE APPLY expected=$expectedApplyId current=$_latestApplyId source=$source',
+        'SKIP STALE APPLY expected=$expectedApplyId current=$_writeGeneration source=$source',
       );
       return state.remote;
     }
@@ -735,9 +775,13 @@ class CartBloc extends Bloc<CartEvent, CartState> {
             ? WardrobeBookingSession.instance.kitGarmentLimit
             : SubscriptionKitPreferences.instance.wardrobeKitMaxGarments);
 
+    // Keep latest remote qty per line id (never sum — duplicates are API noise).
     final preservedItems = <CartItem>[];
     final existingItems = state.items;
-    final newItemsMap = {for (final item in mapped) item.id: item};
+    final newItemsMap = <String, CartItem>{};
+    for (final item in mapped) {
+      newItemsMap[item.id] = item;
+    }
     for (final existing in existingItems) {
       if (newItemsMap.containsKey(existing.id)) {
         preservedItems.add(newItemsMap[existing.id]!);
@@ -753,6 +797,7 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       clearError: true,
       wardrobeKitId: kit.kitId ?? state.wardrobeKitId,
       wardrobeKitProductId: kit.productId ?? state.wardrobeKitProductId,
+      wardrobeKitVariantId: kit.variantId ?? state.wardrobeKitVariantId,
       wardrobeKitDays: kit.days ?? state.wardrobeKitDays,
       wardrobeKitName: kit.name ?? state.wardrobeKitName,
       wardrobeKitMaxGarments:
@@ -790,8 +835,10 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     required String source,
     int? applyId,
     String? clearLineId,
+    bool apply = true,
   }) async {
-    final expected = applyId ?? _latestApplyId;
+    final expected = applyId ?? ++_writeGeneration;
+    _latestApplyId = expected;
     final requestId = _repository.nextRequestId();
     _perf('GET START requestId=$requestId source=$source');
     _addUiLog('GET START productKey=${clearLineId ?? '-'}');
@@ -801,6 +848,7 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       source: source,
     );
     _addUiLog('GET COMPLETE productKey=${clearLineId ?? '-'}');
+    if (!apply) return remote;
     return _applyRemote(
       emit,
       remote: remote,
@@ -810,7 +858,313 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     );
   }
 
-  ({String? kitId, String? productId, int? days, String? name}) _kitFrom(
+  /// Backend cart responses often include historical wardrobe-kit snapshots.
+  /// After a kit write, trust the POST selectedItems (including []) over GET noise.
+  /// After a product-level quantity:0 remove, drop that exact line from remote.
+  RemoteCart _reconcileRemoteWithKitWrite(
+    RemoteCart remote,
+    CartWriteRequest request,
+  ) {
+    // Product-level remove: strip this exact product/variant/type so historical
+    // kit rows in GET cannot resurrect a deleted line.
+    if (request.kitDetails == null && request.quantity <= 0) {
+      final vid = request.variantId?.trim() ?? '';
+      final filtered = remote.items.where((i) {
+        if (i.productId.trim() != request.productId.trim()) return true;
+        if (request.itemType.isNotEmpty &&
+            i.itemType.isNotEmpty &&
+            i.itemType != request.itemType) {
+          return true;
+        }
+        final itemVid = i.variantId?.trim() ?? '';
+        if (vid.isEmpty && itemVid.isEmpty) return false;
+        if (vid.isNotEmpty && itemVid == vid) return false;
+        // No variant on the write — remove all variants of this product+type.
+        if (vid.isEmpty) return false;
+        return true;
+      }).toList();
+      if (filtered.length != remote.items.length) {
+        _perf(
+          'PRODUCT RECONCILE remove productId=${request.productId} '
+          'variantId=${request.variantId ?? '-'} '
+          'dropped=${remote.items.length - filtered.length}',
+        );
+        return _remoteWithItems(remote, filtered);
+      }
+      return remote;
+    }
+
+    if (request.kitDetails == null) return remote;
+    final type = request.itemType.trim();
+    if (type != 'subscription' && type != 'non_subscription') return remote;
+
+    final rawSelected = request.kitDetails!['selectedItems'];
+    final postedIds = <String>{};
+    if (rawSelected is List) {
+      for (final row in rawSelected) {
+        if (row is! Map) continue;
+        final id = (row['productId'] ?? row['product_id'])?.toString().trim();
+        if (id != null && id.isNotEmpty) postedIds.add(id);
+      }
+    }
+
+    final others = remote.items.where((i) => i.itemType != type).toList();
+
+    // Clear kit: drop every wardrobe garment of this section even if GET still
+    // echoes older kit rows.
+    if (request.quantity <= 0 || postedIds.isEmpty) {
+      _perf(
+        'KIT RECONCILE clear type=$type dropped='
+        '${remote.items.length - others.length}',
+      );
+      return _remoteWithItems(remote, others);
+    }
+
+    // Strip resurrected garments that were not in this POST's selectedItems.
+    // (Backend often returns historical kit snapshots with old products.)
+    final kept = remote.items
+        .where((i) => i.itemType == type && postedIds.contains(i.productId))
+        .toList();
+    final merged = [...others, ...kept];
+    final before = remote.items.where((i) => i.itemType == type).length;
+    if (kept.length != before) {
+      _perf(
+        'KIT RECONCILE strip type=$type posted=${postedIds.length} '
+        'before=$before after=${kept.length}',
+      );
+      return _remoteWithItems(remote, merged);
+    }
+    return remote;
+  }
+
+  RemoteCart _remoteWithItems(RemoteCart remote, List<RemoteCartItem> items) {
+    final computedSubtotal = items.fold<num>(
+      0,
+      (s, i) => s + (i.unitPrice > 0 ? (i.unitPrice * i.quantity) : i.lineTotal),
+    );
+    final effectiveSubtotal = computedSubtotal > 0 ? computedSubtotal : remote.subtotal;
+    final effectiveTotal = effectiveSubtotal +
+        remote.deliveryCharge +
+        remote.taxAmount -
+        remote.discountAmount;
+    return RemoteCart(
+      id: remote.id,
+      items: items,
+      customerAddressId: remote.customerAddressId,
+      subtotal: effectiveSubtotal,
+      deliveryCharge: remote.deliveryCharge,
+      discountAmount: remote.discountAmount,
+      taxAmount: remote.taxAmount,
+      totalAmount: effectiveTotal > 0 ? effectiveTotal : remote.totalAmount,
+      itemCount: items.fold<int>(0, (s, i) => s + i.quantity),
+      cartStatus: remote.cartStatus,
+      updatedAt: remote.updatedAt,
+      subscriptionCount: items
+          .where((i) => i.itemType == 'subscription')
+          .fold<int>(0, (s, i) => s + i.quantity),
+      nonSubscriptionCount: items
+          .where((i) => i.itemType == 'non_subscription')
+          .fold<int>(0, (s, i) => s + i.quantity),
+      essentialsCount: items
+          .where((i) => i.itemType == 'essentials')
+          .fold<int>(0, (s, i) => s + i.quantity),
+      kidsCount: items
+          .where((i) => i.itemType == 'kids')
+          .fold<int>(0, (s, i) => s + i.quantity),
+      activeKitPrice: remote.activeKitPrice,
+      securityDepositAmount: remote.securityDepositAmount,
+    );
+  }
+
+  Future<RemoteCart> _writeThenGet(
+    Emitter<CartState> emit, {
+    required CartWriteRequest request,
+    required String source,
+    String? postedType,
+    String? productName,
+    String? lineId,
+  }) async {
+    // Capture generation *before* the network call so a slower older write
+    // cannot apply after a newer empty/remove response.
+    final writeId = ++_writeGeneration;
+    _latestApplyId = writeId;
+    _perf('REQUEST START source=$source productId=${request.productId} writeId=$writeId');
+    final postId = _repository.nextRequestId();
+    final result = await _repository.upsert(
+      request: request,
+      requestId: postId,
+      source: source,
+    );
+    _perf(
+      'REQUEST END duration=${result.durationMs}ms source=$source writeId=$writeId',
+    );
+    _addUiLog('POST COMPLETE productKey=${lineId ?? request.productId}');
+
+    if (writeId != _writeGeneration) {
+      _perf(
+        'SKIP STALE WRITE RESULT writeId=$writeId current=$_writeGeneration source=$source',
+      );
+      if (lineId != null) {
+        _emitClearPending(emit, lineId, '$source.staleSkip');
+      }
+      return state.remote;
+    }
+
+    // Fast-path: clear pending loader immediately upon successful write
+    if (lineId != null && source == 'UpdateQuantity') {
+      _emitClearPending(emit, lineId, '$source.postImmediateDone');
+    }
+
+    late final RemoteCart remote;
+    // Incomplete authoritative payloads (empty after a write that should keep
+    // items) force a GET so Product/Cart screens don't desync.
+    final postLooksIncomplete = request.quantity > 0 &&
+        result.remote.items.isEmpty &&
+        state.items.isNotEmpty;
+
+    // Fast-path for quantity updates: if POST succeeded, avoid blocking UI on a slow GET.
+    // Reconcile locally and fire GET in background without holding any spinner.
+    final isQtyUpdate = source == 'UpdateQuantity';
+    if (isQtyUpdate && !result.isAuthoritative && state.items.isNotEmpty) {
+      _perf('GET DEFERRED reason=POST_INCOMPLETE_QTY source=$source');
+      final updatedRemoteItems = state.remote.items.map((i) {
+        final matches = i.productId == request.productId &&
+            _variantsCompatible(i.variantId, request.variantId);
+        if (matches) {
+          final unit = i.unitPrice > 0
+              ? i.unitPrice
+              : (i.lineTotal / (i.quantity > 0 ? i.quantity : 1));
+          return RemoteCartItem(
+            productId: i.productId,
+            productName: i.productName,
+            variantId: i.variantId,
+            imageUrl: i.imageUrl,
+            categoryName: i.categoryName,
+            productClass: i.productClass,
+            itemType: i.itemType,
+            quantity: request.quantity,
+            unitPrice: unit,
+            lineTotal: unit * request.quantity,
+            size: i.size,
+            kitDetails: i.kitDetails,
+          );
+        }
+        return i;
+      }).toList();
+      remote = await _applyRemote(
+        emit,
+        remote: _remoteWithItems(state.remote, updatedRemoteItems),
+        source: '$source.reconciledFast',
+        expectedApplyId: writeId,
+        clearLineId: lineId,
+      );
+      // Run authoritative GET in background silently without blocking the UI or setting any pending line
+      _enqueue(() async {
+        try {
+          await _getAuthoritative(
+            emit,
+            source: '$source.backgroundSync',
+            applyId: writeId,
+            clearLineId: null,
+            apply: true,
+          );
+        } catch (_) {}
+      });
+      return remote;
+    }
+
+    // Prefer the POST cart when it already includes lines. Only force a follow-up
+    // GET when POST is incomplete/non-authoritative (avoids ~2x latency on add).
+    final usePostCart = result.isAuthoritative && !postLooksIncomplete;
+    if (usePostCart) {
+      _perf(
+        'GET SKIPPED reason=POST_AUTHORITATIVE source=$source '
+        'kit=${request.kitDetails != null}',
+      );
+      _addUiLog(
+        'GET COMPLETE productKey=${lineId ?? request.productId} skipped=true',
+      );
+      remote = await _applyRemote(
+        emit,
+        remote: _reconcileRemoteWithKitWrite(result.remote, request),
+        source: '$source.postCart',
+        expectedApplyId: writeId,
+        clearLineId: lineId,
+      );
+    } else {
+      if (postLooksIncomplete) {
+        _perf('GET FORCED reason=POST_INCOMPLETE source=$source');
+      } else {
+        _perf('GET FORCED reason=POST_NOT_AUTHORITATIVE source=$source');
+      }
+      final fetched = await _getAuthoritative(
+        emit,
+        source: '$source.afterPost',
+        applyId: writeId,
+        clearLineId: lineId,
+        // Defer apply so we can reconcile kit write intent first.
+        apply: false,
+      );
+      if (writeId != _writeGeneration) {
+        _perf(
+          'SKIP STALE WRITE AFTER GET writeId=$writeId current=$_writeGeneration source=$source',
+        );
+        if (lineId != null) {
+          _emitClearPending(emit, lineId, '$source.staleSkipAfterGet');
+        }
+        return state.remote;
+      }
+      remote = await _applyRemote(
+        emit,
+        remote: _reconcileRemoteWithKitWrite(fetched, request),
+        source: '$source.afterPost.reconciled',
+        expectedApplyId: writeId,
+        clearLineId: lineId,
+      );
+    }
+
+    final matched = remote.items.any((item) =>
+        item.productId == request.productId &&
+        _variantsCompatible(item.variantId, request.variantId));
+    _addUiLog(
+      'CART MATCH productKey=${lineId ?? request.productId} $matched',
+    );
+
+    if (postedType != null && request.quantity > 0) {
+      if (usePostCart) {
+        _cartLog(
+          'TYPE CHECK product=${productName ?? request.productId} '
+          'POST=$postedType GET=SKIPPED reason=POST_AUTHORITATIVE '
+          'status=NOT_APPLICABLE',
+        );
+        return remote;
+      }
+      RemoteCartItem? found;
+      for (final item in remote.items) {
+        if (item.productId == request.productId &&
+            (request.variantId == null ||
+                (item.variantId ?? '') == (request.variantId ?? ''))) {
+          found = item;
+          if (item.itemType == postedType) break;
+        }
+      }
+      final got = found?.itemType ?? '-';
+      if (postedType != got) {
+        _cartLog(
+          'BACKEND TYPE MISMATCH product=${productName ?? request.productId} '
+          'POST=$postedType GET=$got — Flutter will not rewrite GET',
+        );
+      } else {
+        _cartLog(
+          'TYPE CHECK product=${productName ?? request.productId} '
+          'POST=$postedType GET=$got status=MATCH',
+        );
+      }
+    }
+    return remote;
+  }
+
+  ({String? kitId, String? productId, String? variantId, int? days, String? name}) _kitFrom(
     RemoteCart remote,
   ) {
     for (final item in remote.items) {
@@ -819,15 +1173,18 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       return (
         kitId: kit.wardrobeKitId,
         productId: kit.wardrobeKitProductId,
+        variantId: kit.wardrobeKitVariantId,
         days: kit.durationDays,
         name: kit.kitType,
       );
     }
-    return (kitId: null, productId: null, days: null, name: null);
+    return (kitId: null, productId: null, variantId: null, days: null, name: null);
   }
 
   List<CartItem> _mapRemote(RemoteCart remote) {
-    return remote.items.map((item) {
+    final result = <CartItem>[];
+    for (final item in remote.items) {
+      if (item.quantity <= 0) continue;
       final type = item.itemType;
       if (type.isEmpty) {
         _cartLog(
@@ -835,15 +1192,34 @@ class CartBloc extends Bloc<CartEvent, CartState> {
           'name=${item.productName}',
         );
       }
-      final image = (item.imageUrl != null && item.imageUrl!.isNotEmpty)
+      String image = (item.imageUrl != null && item.imageUrl!.isNotEmpty)
           ? item.imageUrl!
           : '';
+      if (image.isEmpty) {
+        final local = state.items.where((e) =>
+            e.productId == item.productId &&
+            _variantsCompatible(e.variantId, item.variantId)).firstOrNull;
+        if (local != null && local.imageUrl.isNotEmpty) {
+          image = local.imageUrl;
+        } else {
+          final cached = ProductCache.instance.findById(item.productId);
+          if (cached != null) {
+            ProductVariant? v;
+            if (item.variantId != null) {
+              v = cached.variants.where((vr) => vr.id == item.variantId).firstOrNull;
+            }
+            image = v?.primaryImageUrl ??
+                cached.primaryImageUrl ??
+                (cached.imageUrls.isNotEmpty ? cached.imageUrls.first : '');
+          }
+        }
+      }
       final isSub = type == 'subscription';
       final effectiveUnitPrice = isSub ? 0 : item.unitPrice;
       final price = effectiveUnitPrice > 0
           ? '₹ ${effectiveUnitPrice.round()}'
           : null;
-      return CartItem(
+      final cartItem = CartItem(
         productId: item.productId,
         variantId: item.variantId,
         title: item.productName,
@@ -858,7 +1234,16 @@ class CartBloc extends Bloc<CartEvent, CartState> {
         lineTotal: item.lineTotal,
         kitDetails: item.kitDetails,
       );
-    }).toList();
+
+      final existingIndex = result.indexWhere((r) => r.id == cartItem.id);
+      if (existingIndex >= 0) {
+        // Prefer the later remote row's quantity (matches _deduplicateItems).
+        result[existingIndex] = cartItem;
+      } else {
+        result.add(cartItem);
+      }
+    }
+    return result;
   }
 
   Future<void> _onLoad(LoadCartEvent event, Emitter<CartState> emit) async {
@@ -899,88 +1284,6 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     });
   }
 
-  Future<RemoteCart> _writeThenGet(
-    Emitter<CartState> emit, {
-    required CartWriteRequest request,
-    required String source,
-    String? postedType,
-    String? productName,
-    String? lineId,
-  }) async {
-    _perf('REQUEST START source=$source productId=${request.productId}');
-    final postId = _repository.nextRequestId();
-    final result = await _repository.upsert(
-      request: request,
-      requestId: postId,
-      source: source,
-    );
-    _perf(
-      'REQUEST END duration=${result.durationMs}ms source=$source',
-    );
-    _addUiLog('POST COMPLETE productKey=${lineId ?? request.productId}');
-    final completedId = ++_latestApplyId;
-    late final RemoteCart remote;
-    if (result.isAuthoritative) {
-      _perf('GET SKIPPED reason=POST_AUTHORITATIVE source=$source');
-      _addUiLog(
-        'GET COMPLETE productKey=${lineId ?? request.productId} skipped=true',
-      );
-      remote = await _applyRemote(
-        emit,
-        remote: result.remote,
-        source: '$source.postCart',
-        clearLineId: lineId,
-      );
-    } else {
-      remote = await _getAuthoritative(
-        emit,
-        source: '$source.afterPost',
-        applyId: completedId,
-        clearLineId: lineId,
-      );
-    }
-
-    final matched = remote.items.any((item) =>
-        item.productId == request.productId &&
-        _variantsCompatible(item.variantId, request.variantId));
-    _addUiLog(
-      'CART MATCH productKey=${lineId ?? request.productId} $matched',
-    );
-
-    if (postedType != null && request.quantity > 0) {
-      if (result.isAuthoritative) {
-        _cartLog(
-          'TYPE CHECK product=${productName ?? request.productId} '
-          'POST=$postedType GET=SKIPPED reason=POST_AUTHORITATIVE '
-          'status=NOT_APPLICABLE',
-        );
-        return remote;
-      }
-      RemoteCartItem? found;
-      for (final item in remote.items) {
-        if (item.productId == request.productId &&
-            (request.variantId == null ||
-                (item.variantId ?? '') == (request.variantId ?? ''))) {
-          found = item;
-          if (item.itemType == postedType) break;
-        }
-      }
-      final got = found?.itemType ?? '-';
-      if (postedType != got) {
-        _cartLog(
-          'BACKEND TYPE MISMATCH product=${productName ?? request.productId} '
-          'POST=$postedType GET=$got — Flutter will not rewrite GET',
-        );
-      } else {
-        _cartLog(
-          'TYPE CHECK product=${productName ?? request.productId} '
-          'POST=$postedType GET=$got status=MATCH',
-        );
-      }
-    }
-    return remote;
-  }
-
   String _resolveAddType(CartItem item) {
     var type = item.itemType.trim();
     if (type.isEmpty) {
@@ -998,6 +1301,18 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     return type;
   }
 
+  bool _isWardrobeKitProduct(CartItem item) {
+    final cls = item.productClass?.trim().toLowerCase() ?? '';
+    return cls == 'wardrobe_kit' || cls == 'wardrobekit';
+  }
+
+  /// Garment nested inside a wardrobe kit (flattened cart line), not essentials/kids
+  /// and not the kit parent row itself.
+  bool _isGarmentInsideWardrobeKit(CartItem item) {
+    if (_isWardrobeKitProduct(item)) return false;
+    return item.itemType == 'subscription' || item.itemType == 'non_subscription';
+  }
+
   Future<CartWriteRequest> _buildKitWriteRequest({
     required String itemType,
     required String targetProductId,
@@ -1008,12 +1323,13 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     required String? targetProductClass,
     required String? targetProductName,
     String? lineIdToSkip,
+    CartItem? kitMetaFallback,
   }) async {
     if (itemType != 'subscription' && itemType != 'non_subscription') {
       return CartWriteRequest(
         productId: targetProductId,
         variantId: targetVariantId,
-        quantity: targetQuantity,
+        quantity: targetQuantity <= 0 ? 0 : targetQuantity,
         itemType: itemType,
         size: targetSize,
         categoryName: targetCategory,
@@ -1025,23 +1341,29 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     final garments = <Map<String, dynamic>>[];
     final existingGarments = state.items.where((i) {
       if (i.itemType != itemType) return false;
+      if (_isWardrobeKitProduct(i)) return false;
       if (i.isKids || isKidsCategory(i.category)) return false;
       if (i.isEssential || isEssentialCategory(i.category)) return false;
       return true;
     });
-    
+
     for (final g in existingGarments) {
       if (lineIdToSkip != null && g.id == lineIdToSkip) {
         continue;
       }
       if (g.productId == targetProductId &&
-          (g.variantId ?? '') == (targetVariantId ?? '')) {
+          _variantsCompatible(g.variantId, targetVariantId)) {
         continue;
+      }
+      var garmentVariantId = g.variantId;
+      if (garmentVariantId == null || garmentVariantId.isEmpty) {
+        final gp = ProductCache.instance.findById(g.productId);
+        garmentVariantId = gp?.variants.firstOrNull?.id;
       }
       garments.add({
         'productId': g.productId,
         'quantity': g.quantity,
-        'variantId': g.variantId,
+        'variantId': garmentVariantId,
         'size': g.selectedSize,
         'product_name': g.productName,
         'price': g.unitPrice,
@@ -1050,16 +1372,42 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     }
 
     if (targetQuantity > 0) {
+      String targetImageUrl = '';
+      num targetPrice = 0;
+      final targetProduct = ProductCache.instance.findById(targetProductId);
+      if (targetProduct != null) {
+        ProductVariant? v;
+        if (targetVariantId != null) {
+          v = targetProduct.variants
+              .where((vr) => vr.id == targetVariantId)
+              .firstOrNull;
+        }
+        targetImageUrl = v?.primaryImageUrl ??
+            targetProduct.primaryImageUrl ??
+            (targetProduct.imageUrls.isNotEmpty
+                ? targetProduct.imageUrls.first
+                : '');
+        targetPrice = double.tryParse(v?.actualPrice ?? '') ??
+            double.tryParse(targetProduct.actualPrice) ??
+            0;
+      }
+      var resolvedTargetVariantId = targetVariantId;
+      if (resolvedTargetVariantId == null || resolvedTargetVariantId.isEmpty) {
+        resolvedTargetVariantId = targetProduct?.variants.firstOrNull?.id;
+      }
       garments.add({
         'productId': targetProductId,
         'quantity': targetQuantity,
-        'variantId': targetVariantId,
+        'variantId': resolvedTargetVariantId,
         'size': targetSize,
         'product_name': targetProductName,
+        'price': targetPrice,
+        'primary_image_url': targetImageUrl,
       });
     }
 
     String? kitProductId;
+    String? kitVariantId;
     String? kitId;
     int? durationDays;
     String? kitName;
@@ -1067,46 +1415,127 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     if (existingGarments.isNotEmpty) {
       final existingKit = existingGarments.first.kitDetails;
       kitProductId = existingKit?.wardrobeKitProductId;
+      kitVariantId = existingKit?.wardrobeKitVariantId;
       kitId = existingKit?.wardrobeKitId;
       durationDays = existingKit?.durationDays;
       kitName = existingKit?.kitType;
     }
 
+    final fallbackKit = kitMetaFallback?.kitDetails;
+    kitProductId ??= fallbackKit?.wardrobeKitProductId;
+    kitVariantId ??= fallbackKit?.wardrobeKitVariantId;
+    kitId ??= fallbackKit?.wardrobeKitId;
+    durationDays ??= fallbackKit?.durationDays;
+    kitName ??= fallbackKit?.kitType;
+
+    kitProductId ??= state.wardrobeKitProductId ??
+        SubscriptionKitPreferences.instance.wardrobeKitProductId;
+    kitVariantId ??= state.wardrobeKitVariantId ??
+        SubscriptionKitPreferences.instance.wardrobeKitVariantId;
+    kitId ??=
+        state.wardrobeKitId ?? SubscriptionKitPreferences.instance.wardrobeKitId;
+
+    if (kitProductId == null || kitProductId.isEmpty) {
+      final cachedProducts = ProductCache.instance.products;
+      if (cachedProducts != null && cachedProducts.isNotEmpty) {
+        final category = state.wardrobeCategory ??
+            SubscriptionKitPreferences.instance.wardrobeCategory ??
+            '';
+        final kitProduct = ProductCatalog.findWardrobeKit(cachedProducts, category) ??
+            cachedProducts.where((p) => p.isWardrobeKit).firstOrNull;
+        if (kitProduct != null) {
+          kitProductId = kitProduct.id;
+          kitVariantId ??= kitProduct.variants.firstOrNull?.id;
+        }
+      }
+    }
+
+    if (kitProductId == null || kitProductId.isEmpty) {
+      try {
+        final products = await ProductRepository().getProducts(forceRefresh: false);
+        final category = state.wardrobeCategory ??
+            SubscriptionKitPreferences.instance.wardrobeCategory ??
+            '';
+        final kitProduct = ProductCatalog.findWardrobeKit(products, category) ??
+            products.where((p) => p.isWardrobeKit).firstOrNull;
+        if (kitProduct != null) {
+          kitProductId = kitProduct.id;
+          kitVariantId ??= kitProduct.variants.firstOrNull?.id;
+        }
+      } catch (_) {}
+    }
+
+    final resolvedDays = durationDays ??
+        (state.wardrobeKitDays > 0
+            ? state.wardrobeKitDays
+            : SubscriptionKitPreferences.instance.wardrobeKitDays);
+    var resolvedKitName = (kitName ?? '').trim();
+    if (resolvedKitName.isEmpty) {
+      resolvedKitName = state.wardrobeKitName.isNotEmpty
+          ? state.wardrobeKitName
+          : SubscriptionKitPreferences.instance.wardrobeKitName;
+    }
+
+    final resolvedProductId =
+        (kitProductId != null && kitProductId.isNotEmpty)
+            ? kitProductId
+            : targetProductId;
+
+    String? resolvedVariantId;
+    if (resolvedProductId == targetProductId &&
+        targetVariantId != null &&
+        targetVariantId.isNotEmpty) {
+      resolvedVariantId = targetVariantId;
+    }
+    resolvedVariantId ??= kitVariantId;
+    if (resolvedVariantId == null || resolvedVariantId.isEmpty) {
+      final cached = ProductCache.instance.findById(resolvedProductId);
+      resolvedVariantId = cached?.variants.firstOrNull?.id;
+    }
+    if (resolvedVariantId == null || resolvedVariantId.isEmpty) {
+      resolvedVariantId = targetVariantId;
+    }
+    if ((resolvedVariantId == null || resolvedVariantId.isEmpty) &&
+        isApiUuid(resolvedProductId)) {
+      try {
+        final fetched =
+            await ProductRepository().getProductById(resolvedProductId);
+        resolvedVariantId = fetched.variants.firstOrNull?.id;
+      } catch (e) {
+        _cartLog('Failed to fetch product for variant: $e');
+      }
+    }
+
     final kit = await _repository.subscriptionKitDetails(
-      wardrobeKitId: kitId ?? state.wardrobeKitId,
-      wardrobeKitProductId: kitProductId ?? state.wardrobeKitProductId,
-      durationDays: durationDays ?? state.wardrobeKitDays,
-      kitName: kitName ?? state.wardrobeKitName,
+      wardrobeKitId: kitId,
+      wardrobeKitProductId: resolvedProductId,
+      durationDays: resolvedDays,
+      kitName: resolvedKitName,
       selectedItems: garments,
     );
 
     if (kit != null) {
       kit['non_subscription'] = itemType == 'non_subscription';
       kit['cart_section'] = itemType;
-    }
-    
-    if (kitProductId == null || kitProductId.isEmpty) {
-      return CartWriteRequest(
-        productId: targetProductId,
-        variantId: targetVariantId,
-        quantity: targetQuantity,
-        itemType: itemType,
-        size: targetSize,
-        categoryName: targetCategory,
-        kitDetails: kit,
-        productClass: targetProductClass,
-        productName: targetProductName,
-      );
+      if (kitId != null && kitId.isNotEmpty) {
+        kit['wardrobe_kit_id'] = kitId;
+        kit['kitId'] = kitId;
+      }
     }
 
+    final remaining = garments.isNotEmpty;
     return CartWriteRequest(
-      productId: kitProductId,
-      variantId: null,
-      quantity: garments.isEmpty ? 0 : 1,
+      productId: resolvedProductId,
+      variantId: resolvedVariantId,
+      // Flow 1: remaining garments → qty 1 + updated selectedItems
+      // Last garment / clear kit → qty 0 with kitDetails (empty selectedItems)
+      quantity: remaining ? 1 : 0,
       itemType: itemType,
+      size: null,
+      categoryName: targetCategory,
       kitDetails: kit,
       productClass: 'wardrobe_kit',
-      productName: state.wardrobeKitName ?? 'Wardrobe Kit',
+      productName: resolvedKitName.isNotEmpty ? resolvedKitName : 'Wardrobe Kit',
     );
   }
 
@@ -1122,13 +1551,48 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     _perf('ADD START line=$key product=${event.item.title}');
     _addUiLog('START productKey=$key');
     _inflightLines.add(key);
+
+    // Immediate optimistic update so user sees instant reaction (0ms delay)
+    final qtyToAdd = event.item.quantity > 0 ? event.item.quantity : 1;
+    final existingIdx = state.items.indexWhere((it) => it.id == key);
+    final previousItem = existingIdx >= 0 ? state.items[existingIdx] : null;
+    final prevQty = previousItem?.quantity ?? 0;
+    final nextQty = prevQty + qtyToAdd;
+    final optimisticItem = event.item.copyWith(
+      id: key,
+      quantity: nextQty,
+      itemType: type,
+    );
+    _desiredQty[key] = nextQty;
+    _serverQty[key] = prevQty;
+    _lastKnownItems[key] = previousItem ?? optimisticItem;
+
+    final List<CartItem> nextItems;
+    if (existingIdx >= 0) {
+      nextItems = state.items.map((it) {
+        if (it.id == key) {
+          return it.copyWith(quantity: nextQty);
+        }
+        return it;
+      }).toList();
+    } else {
+      nextItems = [...state.items, optimisticItem];
+    }
+
     _emitLogged(
       emit,
-      state.copyWith(pendingLineIds: _pendingPlus(key)),
-      'AddToCart pending',
+      state.copyWith(
+        items: nextItems,
+        pendingLineIds: _pendingPlus(key),
+      ),
+      'AddToCart optimistic',
     );
     try {
-      await _enqueueLine(key, () => _handleAdd(event, emit, type: type));
+      await _enqueueWrite(
+        key,
+        type,
+        () => _handleAdd(event, emit, type: type, targetQty: nextQty),
+      );
     } catch (e) {
       _addUiLog('CLEAR LOADING productKey=$key error=true');
       final message = e is ApiException ? e.message : e.toString();
@@ -1145,17 +1609,31 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       if (isQuota) {
         logCartQuota(SubscriptionQuotaDetails.parse(message));
       }
+      _desiredQty.remove(key);
+      _serverQty.remove(key);
+
+      // Revert optimistic add on failure (restore prior qty if line existed).
+      final List<CartItem> revertedItems;
+      if (previousItem != null) {
+        revertedItems = state.items.map((it) {
+          if (it.id == key) return previousItem;
+          return it;
+        }).toList();
+      } else {
+        revertedItems = state.items.where((it) => it.id != key).toList();
+      }
       _emitLogged(
         emit,
         state.copyWith(
           status: CartStatus.loaded,
+          items: revertedItems,
           errorMessage: isOos ? null : message,
           pendingLineIds: _pendingMinus(key),
           outOfStockLineIds: isOos
               ? {...state.outOfStockLineIds, key}
               : state.outOfStockLineIds,
         ),
-        'AddToCart error',
+        'AddToCart error rollback',
       );
     } finally {
       _inflightLines.remove(key);
@@ -1171,44 +1649,51 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     AddToCartEvent event,
     Emitter<CartState> emit, {
     required String type,
+    int? targetQty,
   }) async {
     debugPrint('===== CART ADD VARIANT =====');
     debugPrint('productId = ${event.item.productId}');
     debugPrint('variantId = ${event.item.variantId}');
     debugPrint('variantName = ${event.item.title}');
-    
-    final existing = state.lineForProduct(
-      event.item.productId,
-      variantId: event.item.variantId,
-      itemType: type,
-    );
-    final qty = (existing?.quantity ?? 0) + 1;
+
+    final key = _lineId(event.item.productId, event.item.variantId, type);
+    final desired = _desiredQty[key] ?? targetQty ?? (event.item.quantity > 0 ? event.item.quantity : 1);
+
     final request = await _buildKitWriteRequest(
       itemType: type,
       targetProductId: event.item.productId,
       targetVariantId: event.item.variantId,
-      targetQuantity: qty,
+      targetQuantity: desired,
       targetSize: event.item.selectedSize,
       targetCategory: event.item.category,
       targetProductClass: event.item.productClass ?? 'single_item',
       targetProductName: event.item.title,
+      lineIdToSkip: key,
     );
 
+    _serverQty[key] = desired;
     await _writeThenGet(
       emit,
       request: request,
       source: 'AddToCart',
       postedType: type,
       productName: event.item.title,
-      lineId: _lineId(event.item.productId, event.item.variantId, type),
+      lineId: key,
     );
+    // Authoritative apply won; drop coalesced targets for this line.
+    if (_desiredQty[key] == desired) {
+      _desiredQty.remove(key);
+    }
   }
 
   CartItem? _line(String itemId) {
     for (final item in state.items) {
-      if (item.id == itemId) return item;
+      if (item.id == itemId) {
+        _lastKnownItems[itemId] = item;
+        return item;
+      }
     }
-    return null;
+    return _lastKnownItems[itemId];
   }
 
   Future<void> _onRemove(
@@ -1217,39 +1702,59 @@ class CartBloc extends Bloc<CartEvent, CartState> {
   ) async {
     final item = _line(event.itemId);
     if (item == null) return;
-    _desiredQty[item.id] = 0;
+    _desiredQty.remove(item.id);
+    _serverQty.remove(item.id);
     if (_qtyFlushing.contains(item.id)) {
       _perf('DELETE COALESCE to qty=0 line=${item.id}');
       return;
     }
-    if (_inflightLines.contains(item.id) ||
-        state.pendingLineIds.contains(item.id)) {
+    if (_inflightLines.contains(item.id)) {
       _perf('DELETE SKIP duplicate line=${item.id}');
       return;
     }
     final opSw = Stopwatch()..start();
     _perf('DELETE START line=${item.id} product=${item.title}');
     _inflightLines.add(item.id);
+
+    // 1. Immediately remove product from the cart screen (optimistic UI update)
+    final nextItems = state.items.where((it) => it.id != item.id).toList();
+    _lastKnownItems[item.id] = item;
     _emitLogged(
       emit,
-      state.copyWith(pendingLineIds: _pendingPlus(item.id)),
-      'RemoveFromCart pending',
+      state.copyWith(
+        status: CartStatus.updating,
+        items: nextItems,
+        pendingLineIds: _pendingPlus(item.id),
+      ),
+      'RemoveFromCart optimistic',
     );
+
     try {
-      await _enqueueLine(item.id, () => _handleRemove(item.id, emit));
+      await _enqueueWrite(
+        item.id,
+        item.itemType,
+        () => _handleRemove(item.id, emit, targetItem: item),
+      );
     } catch (e) {
+      // Restore optimistic remove so Product/Cart stay in sync with server.
+      final restored = [...state.items];
+      if (!restored.any((it) => it.id == item.id)) {
+        restored.add(item);
+      }
       _emitLogged(
         emit,
         state.copyWith(
           status: CartStatus.loaded,
+          items: restored,
           errorMessage: e.toString(),
           pendingLineIds: _pendingMinus(item.id),
         ),
-        'RemoveFromCart error',
+        'RemoveFromCart error restore',
       );
     } finally {
       _inflightLines.remove(item.id);
       _emitClearPending(emit, item.id, 'RemoveFromCart done');
+      _lastKnownItems.remove(item.id);
       opSw.stop();
       _perf(
         'UI COMPLETE duration=${opSw.elapsedMilliseconds}ms op=DELETE line=${item.id}',
@@ -1257,23 +1762,135 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     }
   }
 
-  Future<void> _handleRemove(String itemId, Emitter<CartState> emit) async {
-    final item = _line(itemId);
+  /// Scenario F.2 — delete entire wardrobe kit (no selectedItems).
+  Map<String, dynamic> _entireKitDeleteKitDetails({
+    required String itemType,
+    String? wardrobeKitId,
+    String? wardrobeKitProductId,
+    String? wardrobeKitVariantId,
+  }) {
+    final session = CheckoutSession.instance;
+    final prefs = SubscriptionKitPreferences.instance;
+    final kitId = wardrobeKitId?.trim() ?? state.wardrobeKitId ?? prefs.wardrobeKitId;
+    final kitPid = wardrobeKitProductId?.trim() ?? state.wardrobeKitProductId ?? prefs.wardrobeKitProductId;
+    final kitVid = wardrobeKitVariantId?.trim() ?? state.wardrobeKitVariantId ?? prefs.wardrobeKitVariantId;
+    final addressId = session.addressId?.trim() ?? prefs.addressId;
+    final days = state.wardrobeKitDays > 0
+        ? state.wardrobeKitDays
+        : (prefs.wardrobeKitDays > 0 ? prefs.wardrobeKitDays : 1);
+    final kitType = session.kitType ??
+        (state.wardrobeKitName.isNotEmpty
+            ? state.wardrobeKitName
+            : (prefs.kitType ?? '$days-Day wardrobe Kit'));
+
+    final details = <String, dynamic>{
+      'gender': session.gender ?? prefs.gender ?? 'male',
+      'bodyType': session.bodyType ?? 'regular',
+      'kit_type': kitType,
+      if (session.apiDeliveryDate != null) 'delivery_date': session.apiDeliveryDate,
+      if (session.apiDeliveryDate != null) 'deliveryDate': session.apiDeliveryDate,
+      if (session.deliveryTime != null) 'delivery_time': session.deliveryTime,
+      if (session.deliveryTime != null) 'deliveryTime': session.deliveryTime,
+      if (addressId != null && addressId.isNotEmpty) 'customerAddressId': addressId,
+      if (kitId != null && kitId.isNotEmpty) 'wardrobe_kit_id': kitId,
+      if (kitId != null && kitId.isNotEmpty) 'kitId': kitId,
+      if (kitPid != null && kitPid.isNotEmpty) 'wardrobe_kit_product_id': kitPid,
+      if (kitVid != null && kitVid.isNotEmpty) 'wardrobe_kit_variant_id': kitVid,
+      'duration_days': days,
+      'durationDays': days,
+      'selectedItems': const [],
+      'non_subscription': itemType == 'non_subscription',
+      'cart_section': itemType,
+    };
+    return details;
+  }
+
+  Future<void> _handleRemove(
+    String itemId,
+    Emitter<CartState> emit, {
+    CartItem? targetItem,
+  }) async {
+    final item = targetItem ?? _line(itemId);
     if (item == null) return;
     _desiredQty.remove(item.id);
+    _serverQty.remove(item.id);
     _perf('UPDATE/POST START op=DELETE line=$itemId');
-    
-    final request = await _buildKitWriteRequest(
-      itemType: item.itemType,
-      targetProductId: item.productId,
-      targetVariantId: item.variantId,
-      targetQuantity: 0,
-      targetSize: item.selectedSize,
-      targetCategory: item.categoryName,
-      targetProductClass: item.productClass ?? 'single_item',
-      targetProductName: item.productName,
-      lineIdToSkip: item.id,
-    );
+
+    final CartWriteRequest request;
+
+    if (_isGarmentInsideWardrobeKit(item)) {
+      // Scenario E: remove one garment from inside a wardrobe kit by rewriting
+      // the parent kit with remaining selectedItems (qty 1).
+      // If none remain → Scenario F.2 delete entire kit (qty 0).
+      var kitRequest = await _buildKitWriteRequest(
+        itemType: item.itemType,
+        targetProductId: item.productId,
+        targetVariantId: item.variantId,
+        targetQuantity: 0,
+        targetSize: item.selectedSize,
+        targetCategory: item.categoryName,
+        targetProductClass: item.productClass ?? 'single_item',
+        targetProductName: item.productName,
+        lineIdToSkip: item.id,
+        kitMetaFallback: item,
+      );
+
+      if (kitRequest.quantity <= 0) {
+        request = (kitRequest.kitDetails != null && kitRequest.kitDetails!.isNotEmpty)
+            ? kitRequest
+            : CartWriteRequest(
+                productId: kitRequest.productId,
+                variantId: kitRequest.variantId,
+                quantity: 0,
+                itemType: item.itemType,
+                kitDetails: _entireKitDeleteKitDetails(
+                  itemType: item.itemType,
+                  wardrobeKitId: item.kitDetails?.wardrobeKitId ?? state.wardrobeKitId,
+                  wardrobeKitProductId: kitRequest.productId,
+                  wardrobeKitVariantId: kitRequest.variantId,
+                ),
+                productClass: 'wardrobe_kit',
+                productName: kitRequest.productName,
+              );
+        _perf('DELETE ENTIRE_KIT (last garment) productId=${request.productId}');
+      } else {
+        request = kitRequest;
+        _perf(
+          'DELETE KIT_GARMENT parent=${request.productId} '
+          'qty=${request.quantity} selected='
+          '${(request.kitDetails?['selectedItems'] is List) ? (request.kitDetails!['selectedItems'] as List).length : 0}',
+        );
+      }
+    } else if (_isWardrobeKitProduct(item)) {
+      // Scenario F.2: delete entire wardrobe kit card.
+      final kitId = item.kitDetails?.wardrobeKitId ?? state.wardrobeKitId;
+      final kitPid = item.productId.isNotEmpty ? item.productId : (state.wardrobeKitProductId ?? item.productId);
+      request = CartWriteRequest(
+        productId: kitPid,
+        variantId: state.wardrobeKitVariantId ?? item.variantId,
+        quantity: 0,
+        itemType: item.itemType,
+        kitDetails: _entireKitDeleteKitDetails(
+          itemType: item.itemType,
+          wardrobeKitId: kitId,
+          wardrobeKitProductId: kitPid,
+          wardrobeKitVariantId: state.wardrobeKitVariantId ?? item.variantId,
+        ),
+        productClass: 'wardrobe_kit',
+        productName: item.productName,
+      );
+      _perf('DELETE ENTIRE_KIT productId=${item.productId}');
+    } else {
+      // Scenario F.1: standalone product (essentials / kids / independent).
+      request = CartWriteRequest(
+        productId: item.productId,
+        variantId: item.variantId,
+        quantity: 0,
+        itemType: item.itemType,
+        productName: item.productName,
+      );
+      _perf('DELETE STANDALONE productId=${item.productId}');
+    }
 
     await _writeThenGet(
       emit,
@@ -1321,62 +1938,29 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     final item = _line(event.itemId);
     if (item == null) return;
 
-    int targetQty = item.quantity;
-    String? newVariantId = item.variantId;
-    String? newVariantName = item.productName;
-    String? oldColor;
-
     final product = ProductCache.instance.findById(item.productId);
-    if (product != null && item.variantId != null) {
+    if (product == null) return;
+
+    String? currentColor;
+    if (item.variantId != null) {
       final oldVariant = product.variants.where((v) => v.id == item.variantId).firstOrNull;
       if (oldVariant != null) {
-        oldColor = ProductMapper.optionValue(oldVariant, 'Color');
-      }
-
-      final newVariant = ProductMapper.matchingVariant(
-        variants: product.variants,
-        selectedColor: oldColor,
-        selectedSize: event.size,
-      );
-
-      if (newVariant != null) {
-        newVariantId = newVariant.id;
-        newVariantName = newVariant.variantName;
-        
-        if (targetQty > newVariant.stockOnHand && newVariant.stockOnHand > 0) {
-          targetQty = newVariant.stockOnHand;
-        }
-
-        debugPrint('===== CART SIZE CHANGED =====');
-        debugPrint('OLD VARIANT ID = ${item.variantId}');
-        debugPrint('SELECTED SIZE = ${event.size}');
-        debugPrint('SELECTED COLOR = $oldColor');
-        debugPrint('RESOLVED VARIANT ID = ${newVariant.id}');
-        debugPrint('RESOLVED VARIANT NAME = ${newVariant.variantName}');
-        debugPrint('RESOLVED STOCK = ${newVariant.stockOnHand}');
-        debugPrint('==============================');
+        currentColor = ProductMapper.optionValue(oldVariant, 'Color');
       }
     }
 
-    final request = await _buildKitWriteRequest(
-      itemType: item.itemType,
-      targetProductId: item.productId,
-      targetVariantId: newVariantId,
-      targetQuantity: targetQty,
-      targetSize: event.size,
-      targetCategory: item.categoryName,
-      targetProductClass: item.productClass ?? 'single_item',
-      targetProductName: newVariantName,
-      lineIdToSkip: item.id,
+    final newVariant = ProductMapper.matchingVariant(
+      variants: product.variants,
+      selectedColor: currentColor,
+      selectedSize: event.size,
     );
 
-    _perf('UPDATE/POST START op=SIZE line=${event.itemId} size=${event.size}');
-    await _writeThenGet(
-      emit,
-      request: request,
-      source: 'UpdateSize',
-      lineId: item.id,
-    );
+    if (newVariant != null) {
+      await _onUpdateVariant(
+        UpdateCartItemVariantEvent(item.id, newVariant),
+        emit,
+      );
+    }
   }
 
   Future<void> _onUpdateVariant(
@@ -1385,80 +1969,184 @@ class CartBloc extends Bloc<CartEvent, CartState> {
   ) async {
     final item = _line(event.itemId);
     if (item == null) return;
-    if (_inflightLines.contains(item.id)) return;
+    if (item.variantId == event.newVariant.id) return;
+
+    final newVariant = event.newVariant;
+    final newSize = ProductMapper.optionValue(newVariant, 'Size') ?? item.selectedSize;
+    int targetQty = item.quantity;
+    if (targetQty > newVariant.stockOnHand && newVariant.stockOnHand > 0) {
+      targetQty = newVariant.stockOnHand;
+    }
+    if (targetQty < 1) targetQty = 1;
+
+    final newImageUrl = (newVariant.primaryImageUrl != null && newVariant.primaryImageUrl!.isNotEmpty)
+        ? newVariant.primaryImageUrl!
+        : item.imageUrl;
+
+    final newPrice = (item.isEssential || !item.isSubscriptionGarment) &&
+            newVariant.actualPrice.isNotEmpty &&
+            newVariant.actualPrice != '0'
+        ? '₹ ${double.tryParse(newVariant.actualPrice)?.round() ?? newVariant.actualPrice}'
+        : item.price;
+
+    final newTitle = newVariant.variantName.isNotEmpty ? newVariant.variantName : item.title;
+    final newLineId = _lineId(item.productId, newVariant.id, item.itemType);
+
+    // Immediate optimistic update
+    final existingIndex = state.items.indexWhere((it) => it.id == newLineId);
+    List<CartItem> updatedItems;
+    int effectiveTargetQty = targetQty;
+
+    if (existingIndex >= 0 && state.items[existingIndex].id != item.id) {
+      // Merge into existing item with the same variant
+      final existing = state.items[existingIndex];
+      effectiveTargetQty = existing.quantity + targetQty;
+      if (newVariant.stockOnHand > 0 && effectiveTargetQty > newVariant.stockOnHand) {
+        effectiveTargetQty = newVariant.stockOnHand;
+      }
+      updatedItems = state.items
+          .where((it) => it.id != item.id)
+          .map((it) => it.id == newLineId ? it.copyWith(quantity: effectiveTargetQty) : it)
+          .toList();
+    } else {
+      // Replace item in-place
+      final updatedItem = CartItem(
+        id: newLineId,
+        productId: item.productId,
+        variantId: newVariant.id,
+        title: newTitle,
+        imageUrl: newImageUrl,
+        price: newPrice,
+        selectedSize: newSize,
+        quantity: targetQty,
+        itemType: item.itemType,
+        category: item.category,
+        productClass: item.productClass,
+        unitPrice: double.tryParse(newVariant.actualPrice) ?? item.unitPrice,
+        lineTotal: (double.tryParse(newVariant.actualPrice) ?? item.unitPrice) * targetQty,
+        kitDetails: item.kitDetails,
+      );
+      updatedItems = state.items.map((it) => it.id == item.id ? updatedItem : it).toList();
+    }
+
+    // Snapshot pre-variant items for rollback / resync on failure.
+    final itemsBeforeVariant = List<CartItem>.from(state.items);
+
+    _inflightLines.add(newLineId);
     _inflightLines.add(item.id);
     _emitLogged(
       emit,
-      state.copyWith(pendingLineIds: _pendingPlus(item.id)),
-      'UpdateVariant pending',
+      state.copyWith(
+        items: updatedItems,
+        pendingLineIds: {...state.pendingLineIds, newLineId, item.id},
+      ),
+      'UpdateVariant optimistic',
     );
+
     try {
-      await _enqueueLine(item.id, () => _handleUpdateVariant(event, emit));
-    } catch (e) {
-      _emitLogged(
-        emit,
-        state.copyWith(
-          status: CartStatus.loaded,
-          errorMessage: e.toString(),
-          pendingLineIds: _pendingMinus(item.id),
+      await _enqueueWrite(
+        newLineId,
+        item.itemType,
+        () => _handleUpdateVariant(
+          item: item,
+          newVariant: newVariant,
+          newSize: newSize,
+          newTitle: newTitle,
+          targetQty: effectiveTargetQty,
+          newLineId: newLineId,
+          emit: emit,
         ),
-        'UpdateVariant error',
       );
+    } catch (e) {
+      try {
+        await _getAuthoritative(emit, source: 'UpdateVariant.error');
+      } catch (_) {
+        _emitLogged(
+          emit,
+          state.copyWith(
+            status: CartStatus.loaded,
+            items: itemsBeforeVariant,
+            errorMessage: e.toString(),
+            pendingLineIds: _pendingMinus(newLineId)..remove(item.id),
+          ),
+          'UpdateVariant error rollback',
+        );
+      }
     } finally {
+      _inflightLines.remove(newLineId);
       _inflightLines.remove(item.id);
+      _emitClearPending(emit, newLineId, 'UpdateVariant done');
       _emitClearPending(emit, item.id, 'UpdateVariant done');
     }
   }
 
-  Future<void> _handleUpdateVariant(
-    UpdateCartItemVariantEvent event,
-    Emitter<CartState> emit,
-  ) async {
-    final item = _line(event.itemId);
-    if (item == null) return;
-
-    if (item.variantId == event.newVariant.id) return;
-
-    int targetQty = item.quantity;
-    if (targetQty > event.newVariant.stockOnHand && event.newVariant.stockOnHand > 0) {
-      targetQty = event.newVariant.stockOnHand;
+  Future<void> _handleUpdateVariant({
+    required CartItem item,
+    required ProductVariant newVariant,
+    required String newSize,
+    required String newTitle,
+    required int targetQty,
+    required String newLineId,
+    required Emitter<CartState> emit,
+  }) async {
+    if (_isGarmentInsideWardrobeKit(item)) {
+      // Rewrite parent kit with the new variant in selectedItems.
+      final request = await _buildKitWriteRequest(
+        itemType: item.itemType,
+        targetProductId: item.productId,
+        targetVariantId: newVariant.id,
+        targetQuantity: targetQty,
+        targetSize: newSize,
+        targetCategory: item.categoryName,
+        targetProductClass: item.productClass ?? 'single_item',
+        targetProductName: newTitle,
+        lineIdToSkip: item.id,
+        kitMetaFallback: item,
+      );
+      _perf('UPDATE/POST START op=VARIANT_KIT line=$newLineId');
+      await _writeThenGet(
+        emit,
+        request: request,
+        source: 'UpdateVariant',
+        lineId: newLineId,
+      );
+      return;
     }
-    if (targetQty < 1) targetQty = 1;
 
-    final newSize = ProductMapper.optionValue(event.newVariant, 'Size') ?? item.selectedSize;
-    final newColor = ProductMapper.optionValue(event.newVariant, 'Color');
+    // Scenario F then A/B: standalone — remove old variant, add/update new.
+    if (item.variantId != null &&
+        item.variantId!.isNotEmpty &&
+        item.variantId != newVariant.id) {
+      await _repository.upsert(
+        request: CartWriteRequest(
+          productId: item.productId,
+          variantId: item.variantId,
+          quantity: 0,
+          itemType: item.itemType,
+          productName: item.productName,
+        ),
+        requestId: _repository.nextRequestId(),
+        source: 'UpdateVariant.removeOld',
+      );
+    }
 
-    debugPrint('===== CART VARIANT CHANGE =====');
-    debugPrint('PRODUCT ID = ${item.productId}');
-    debugPrint('OLD VARIANT ID = ${item.variantId}');
-    debugPrint('OLD VARIANT NAME = ${item.productName}');
-    debugPrint('SELECTED SIZE = $newSize');
-    debugPrint('SELECTED COLOR = $newColor');
-    debugPrint('NEW VARIANT ID = ${event.newVariant.id}');
-    debugPrint('NEW VARIANT NAME = ${event.newVariant.variantName}');
-    debugPrint('NEW STOCK = ${event.newVariant.stockOnHand}');
-    debugPrint('CURRENT QTY = ${item.quantity}');
-    debugPrint('FINAL QTY = $targetQty');
-    debugPrint('===============================');
-
-    final request = await _buildKitWriteRequest(
+    final request = CartWriteRequest(
+      productId: item.productId,
+      variantId: newVariant.id,
+      quantity: targetQty,
       itemType: item.itemType,
-      targetProductId: item.productId,
-      targetVariantId: event.newVariant.id,
-      targetQuantity: targetQty,
-      targetSize: newSize,
-      targetCategory: item.categoryName,
-      targetProductClass: item.productClass ?? 'single_item',
-      targetProductName: event.newVariant.variantName,
-      lineIdToSkip: item.id,
+      size: newSize,
+      categoryName: item.categoryName,
+      productClass: item.productClass ?? 'single_item',
+      productName: newTitle,
     );
 
-    _perf('UPDATE/POST START op=VARIANT line=${event.itemId}');
+    _perf('UPDATE/POST START op=VARIANT_ITEM line=$newLineId');
     await _writeThenGet(
       emit,
       request: request,
       source: 'UpdateVariant',
-      lineId: item.id,
+      lineId: newLineId,
     );
   }
 
@@ -1467,27 +2155,44 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       final item = _line(itemId);
       final desired = _desiredQty[itemId];
       if (item == null || desired == null) return;
-      if (desired == item.quantity) {
+      if (_serverQty[itemId] == desired) {
         _desiredQty.remove(itemId);
         return;
       }
       if (desired <= 0) {
         _desiredQty.remove(itemId);
+        _serverQty.remove(itemId);
         await _handleRemove(itemId, emit);
         return;
       }
-      final request = await _buildKitWriteRequest(
-        itemType: item.itemType,
-        targetProductId: item.productId,
-        targetVariantId: item.variantId,
-        targetQuantity: desired,
-        targetSize: item.selectedSize,
-        targetCategory: item.categoryName,
-        targetProductClass: item.productClass ?? 'single_item',
-        targetProductName: item.productName,
-        lineIdToSkip: item.id,
-      );
 
+      final CartWriteRequest request;
+      if (_isGarmentInsideWardrobeKit(item)) {
+        // Kit garment qty change → update parent kit selectedItems (Scenario C/E).
+        request = await _buildKitWriteRequest(
+          itemType: item.itemType,
+          targetProductId: item.productId,
+          targetVariantId: item.variantId,
+          targetQuantity: desired,
+          targetSize: item.selectedSize,
+          targetCategory: item.categoryName,
+          targetProductClass: item.productClass ?? 'single_item',
+          targetProductName: item.productName,
+          lineIdToSkip: item.id,
+          kitMetaFallback: item,
+        );
+      } else {
+        // Scenario A/B: standalone product quantity update.
+        request = CartWriteRequest(
+          productId: item.productId,
+          variantId: item.variantId,
+          quantity: desired,
+          itemType: item.itemType,
+          productName: item.productName,
+        );
+      }
+
+      _serverQty[itemId] = desired;
       await _writeThenGet(
         emit,
         request: request,
@@ -1503,10 +2208,32 @@ class CartBloc extends Bloc<CartEvent, CartState> {
   ) async {
     final item = _line(event.itemId);
     if (item == null) return;
-    if (state.isLinePending(item.id) && !_qtyFlushing.contains(item.id)) {
+
+    if (event.quantity <= 0) {
+      await _onRemove(RemoveFromCartEvent(event.itemId), emit);
       return;
     }
+
     _desiredQty[item.id] = event.quantity;
+
+    // Immediate optimistic update of item quantity
+    final updatedItems = state.items.map((it) {
+      if (it.id == item.id) {
+        return it.copyWith(quantity: event.quantity);
+      }
+      return it;
+    }).toList();
+
+    _emitLogged(
+      emit,
+      state.copyWith(
+        status: CartStatus.updating,
+        items: updatedItems,
+        pendingLineIds: _pendingPlus(item.id),
+      ),
+      'Quantity optimistic ${event.quantity}',
+    );
+
     _perf('QUANTITY START line=${item.id} desired=${event.quantity}');
     if (_qtyFlushing.contains(item.id)) {
       _perf('QUANTITY COALESCE line=${item.id} desired=${event.quantity}');
@@ -1521,19 +2248,8 @@ class CartBloc extends Bloc<CartEvent, CartState> {
   ) async {
     final item = _line(event.itemId);
     if (item == null || event.delta == 0) return;
-    if (state.isLinePending(item.id) && !_qtyFlushing.contains(item.id)) {
-      return;
-    }
     final next = (_desiredQty[item.id] ?? item.quantity) + event.delta;
-    _desiredQty[item.id] = next;
-    _perf(
-      'QUANTITY START line=${item.id} desired=$next delta=${event.delta}',
-    );
-    if (_qtyFlushing.contains(item.id)) {
-      _perf('QUANTITY COALESCE line=${item.id} desired=$next');
-      return;
-    }
-    await _runQtyFlush(item.id, emit);
+    await _onQty(UpdateCartItemQuantityEvent(event.itemId, next), emit);
   }
 
   Future<void> _runQtyFlush(String itemId, Emitter<CartState> emit) async {
@@ -1548,7 +2264,10 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       );
     }
     try {
-      await _enqueueLine(itemId, () async {
+      await _enqueueWrite(itemId, _line(itemId)?.itemType ?? 'non_subscription',
+          () async {
+        // Debounce slightly to coalesce rapid clicks into a single backend request
+        await Future.delayed(const Duration(milliseconds: 150));
         final desired = _desiredQty[itemId] ?? 0;
         if (desired <= 0) {
           _desiredQty.remove(itemId);
@@ -1586,18 +2305,44 @@ class CartBloc extends Bloc<CartEvent, CartState> {
           state.copyWith(status: CartStatus.updating),
           'ClearCart',
         );
+        final clearedKitIds = <String>{};
         for (final item in List<CartItem>.from(state.items)) {
-          await _repository.upsert(
-            request: CartWriteRequest(
-              productId: item.productId,
-              variantId: item.variantId,
-              quantity: 0,
-              itemType: item.itemType,
-              productClass: item.productClass ?? 'single_item',
-            ),
-            requestId: _repository.nextRequestId(),
-            source: 'ClearCart',
-          );
+          if (_isGarmentInsideWardrobeKit(item) || _isWardrobeKitProduct(item)) {
+            final kitPid = (_isWardrobeKitProduct(item)
+                    ? item.productId
+                    : (item.kitDetails?.wardrobeKitProductId ??
+                        state.wardrobeKitProductId ??
+                        ''))
+                .trim();
+            if (kitPid.isEmpty || clearedKitIds.contains(kitPid)) continue;
+            clearedKitIds.add(kitPid);
+            await _repository.upsert(
+              request: CartWriteRequest(
+                productId: kitPid,
+                quantity: 0,
+                itemType: item.itemType,
+                kitDetails: _entireKitDeleteKitDetails(
+                  itemType: item.itemType,
+                  wardrobeKitId:
+                      item.kitDetails?.wardrobeKitId ?? state.wardrobeKitId,
+                ),
+                productClass: 'wardrobe_kit',
+              ),
+              requestId: _repository.nextRequestId(),
+              source: 'ClearCart.kit',
+            );
+          } else {
+            await _repository.upsert(
+              request: CartWriteRequest(
+                productId: item.productId,
+                variantId: item.variantId,
+                quantity: 0,
+                itemType: item.itemType,
+              ),
+              requestId: _repository.nextRequestId(),
+              source: 'ClearCart.item',
+            );
+          }
         }
         await _getAuthoritative(emit, source: 'ClearCart.afterPost');
       } catch (_) {
@@ -1615,10 +2360,13 @@ class CartBloc extends Bloc<CartEvent, CartState> {
     Emitter<CartState> emit,
   ) async {
     _desiredQty.clear();
+    _serverQty.clear();
+    _lastKnownItems.clear();
     _inflightLines.clear();
     _qtyFlushing.clear();
     _lineOps.clear();
     _latestApplyId = _repository.nextRequestId();
+    _writeGeneration = _latestApplyId;
     _emitLogged(
       emit,
       const CartState(status: CartStatus.loaded),
@@ -1634,18 +2382,39 @@ class CartBloc extends Bloc<CartEvent, CartState> {
       final paid = List<CartItem>.from(state.paidRentalGarmentItems);
       if (paid.isEmpty) return;
       try {
-        for (final item in paid) {
+        final kitPid = (paid.first.kitDetails?.wardrobeKitProductId ??
+                state.wardrobeKitProductId ??
+                '')
+            .trim();
+        if (kitPid.isNotEmpty) {
           await _repository.upsert(
             request: CartWriteRequest(
-              productId: item.productId,
-              variantId: item.variantId,
+              productId: kitPid,
               quantity: 0,
-              itemType: item.itemType,
-              productClass: item.productClass ?? 'single_item',
+              itemType: 'non_subscription',
+              kitDetails: _entireKitDeleteKitDetails(
+                itemType: 'non_subscription',
+                wardrobeKitId: paid.first.kitDetails?.wardrobeKitId ??
+                    state.wardrobeKitId,
+              ),
+              productClass: 'wardrobe_kit',
             ),
             requestId: _repository.nextRequestId(),
-            source: 'ClearPaidRental',
+            source: 'ClearPaidRental.kit',
           );
+        } else {
+          for (final item in paid) {
+            await _repository.upsert(
+              request: CartWriteRequest(
+                productId: item.productId,
+                variantId: item.variantId,
+                quantity: 0,
+                itemType: item.itemType,
+              ),
+              requestId: _repository.nextRequestId(),
+              source: 'ClearPaidRental.item',
+            );
+          }
         }
         await _getAuthoritative(emit, source: 'ClearPaidRental.afterPost');
       } catch (e) {

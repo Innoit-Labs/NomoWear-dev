@@ -1,6 +1,8 @@
+import 'dart:convert';
 import 'package:nomowear/features/auth/data/models/customer.dart';
 import 'package:nomowear/features/orders/data/models/order_history.dart';
 import 'package:nomowear/features/orders/data/pending_return_store.dart';
+import 'package:nomowear/features/profile/domain/order_action.dart';
 import 'package:nomowear/features/profile/domain/user_order.dart';
 
 class UserOrderMapper {
@@ -11,11 +13,14 @@ class UserOrderMapper {
     'RETURNED',
     'APPROVED',
     'RETURN_APPROVED',
+    'RETURN_PENDING',
+    'PICKUP_SCHEDULED',
   };
 
   static bool isReturnTimelineStatus(String? status) {
     final normalized = status?.trim().toUpperCase() ?? '';
-    return _returnTimelineStatuses.contains(normalized);
+    return _returnTimelineStatuses.contains(normalized) ||
+        normalized.contains('RETURN');
   }
 
   static List<UserOrder> fromHistory(
@@ -43,12 +48,20 @@ class UserOrderMapper {
       }
     }
 
-    final isKit = selectedGarments.isNotEmpty;
-    final garmentCount = isKit
-        ? selectedGarments.length
+    final expandedItems = _expandItemsForDisplay(items);
+    final garmentCount = expandedItems.isNotEmpty
+        ? expandedItems.fold<int>(
+            0,
+            (sum, item) => sum + (item.quantity > 0 ? item.quantity : 1),
+          )
         : (items.isEmpty
             ? 1
-            : items.fold<int>(0, (sum, item) => sum + item.quantity));
+            : items.fold<int>(
+                0,
+                (sum, item) => sum + (item.quantity > 0 ? item.quantity : 1),
+              ));
+
+    final isKit = selectedGarments.isNotEmpty;
 
     final title = isKit
         ? _kitTitle(matchedKitDetails, order)
@@ -63,11 +76,23 @@ class UserOrderMapper {
         : _coverImages(items);
 
     final isDelivered = order.isDelivered;
-    final pendingReturn = PendingReturnStore.instance.contains(order.id);
-    // Waitlisted returns stay ACTIVE on API until admin approval.
+    final returnSettled = _apiReturnSettled(order);
+    final returnFailed = order.hasReturnFailed;
+    final pendingReturn = !returnSettled &&
+        !returnFailed &&
+        PendingReturnStore.instance.contains(order.id);
+    // Waitlisted / submitted returns stay in return flow until admin approval.
     final inReturnFlow =
         isDelivered && (order.isInReturnFlow || pendingReturn);
-    final canReturn = order.canReturn && !pendingReturn;
+    // Once return is submitted (pendingReturn == true), return button is hidden.
+    final canReturn = !pendingReturn &&
+        !order.isReturnSettled &&
+        (order.canReturn ||
+            (!inReturnFlow &&
+                (order.canReattemptReturn || order.hasReturnFailed)));
+    final hasActiveReturnFailed =
+        !pendingReturn && !order.isReturnSettled && order.hasReturnFailed;
+
     final statusCopy = _statusCopy(
       order,
       isDelivered,
@@ -80,11 +105,25 @@ class UserOrderMapper {
         order.createdAt;
     final formattedDelivery = _formatDisplayDate(parsedDeliveryDate);
 
-    // Once admin approves (API reflects return timeline), drop local pending.
-    if (order.shouldShowReturnTimeline || order.isReturnComplete) {
-      // Fire-and-forget; UI already has correct flags from API.
+    // Keep the submitted-return flag until the API says the return is
+    // finished. A later refresh that falls back to ACTIVE must not show
+    // "Return Order" again.
+    if (returnSettled || returnFailed) {
       PendingReturnStore.instance.clear(order.id);
     }
+
+    final kitPrice = matchedKitDetails?.price ?? 0;
+    final action = OrderActionResolver.resolve(
+      orderStatus: order.orderStatus,
+      returnStatus: order.returnStatus,
+      isReturnWaitlisted: order.isReturnWaitlisted,
+      wasDelivered: order.isDelivered,
+      hasReturnedAt: order.returnedAt != null,
+      refundStatus: order.refundStatus,
+      daysLeft: order.daysLeft,
+      pendingReturn: pendingReturn,
+      returnFailed: returnFailed,
+    );
 
     return UserOrder(
       id: order.id,
@@ -100,6 +139,9 @@ class UserOrderMapper {
       isDelivered: isDelivered,
       canReturn: canReturn,
       isInReturnFlow: inReturnFlow,
+      hasReturnFailed: hasActiveReturnFailed,
+      canReattemptReturn: hasActiveReturnFailed ? order.canReattemptReturn : false,
+      rejectionReason: hasActiveReturnFailed ? order.rejectionReason : null,
       lineItems: items.isEmpty ? null : _lineItems(order, items, isDelivered),
       addressLabel: address.label,
       addressLines: address.lines,
@@ -108,8 +150,46 @@ class UserOrderMapper {
       isWardrobeKit: isKit,
       totalGarmentsCount: garmentCount,
       deliveryDateFormatted: formattedDelivery,
+      deliveryDate: parsedDeliveryDate,
       totalAmount: order.totalAmount,
+      invoiceNumber: order.invoiceNumber,
+      orderType: order.orderType,
+      paymentStatus: order.paymentStatus,
+      paymentMethod: order.paymentMethod,
+      subtotal: order.subtotal > 0 ? order.subtotal : (kitPrice > 0 ? kitPrice : 0),
+      deliveryCharge: order.deliveryCharge,
+      taxAmount: order.taxAmount,
+      discountAmount: order.discountAmount,
+      securityDepositAmount: order.securityDepositAmount,
+      securityDepositRefundStatus: order.securityDepositRefundStatus,
+      securityDepositRefundAmount: order.securityDepositRefundAmount,
+      transactionId: order.razorpayPaymentId,
+      createdAt: order.createdAt,
+      deliveryTime: order.resolvedDeliveryTime,
+      orderStatusRaw: order.orderStatus,
+      kitPrice: kitPrice,
+      pickupDate: order.pickupDetails?.pickupDate,
+      pickupTime: order.pickupDetails?.pickupTime,
+      pickupNote: order.pickupDetails?.note,
+      pickupMobile: order.pickupDetails?.mobile,
+      pickupFullName: order.pickupDetails?.fullName,
+      actionLabel: action.label,
+      actionEnabled: action.enabled,
+      actionFlow: action.flow,
+      returnStatus: order.returnStatus,
+      daysLeft: order.daysLeft,
+      customerAddressId: order.resolvedCustomerAddressId,
     );
+  }
+
+  static bool _apiReturnSettled(OrderHistoryItem order) {
+    final status = order.orderStatus?.trim().toUpperCase() ?? '';
+    final ret = order.returnStatus?.trim().toUpperCase() ?? '';
+    const settled = {'RETURNED', 'RETURNED_TO_IAP'};
+    if (settled.contains(status) || settled.contains(ret)) return true;
+    if (order.returnedAt != null) return true;
+    final refund = order.refundStatus?.trim().toUpperCase() ?? '';
+    return refund == 'REFUNDED';
   }
 
   static String _kitTitle(
@@ -142,20 +222,25 @@ class UserOrderMapper {
       );
     }
 
-    if (order.isInReturnFlow || pendingReturn) {
+    if (pendingReturn) {
+      return (
+        label: 'Return status',
+        date: 'Pending approval',
+      );
+    }
+
+    if (order.isInReturnFlow) {
       final status = order.returnStatus?.trim();
-      if (pendingReturn &&
-          (status == null ||
-              status.isEmpty ||
-              status.toUpperCase() == 'ACTIVE')) {
-        return (
-          label: 'Return status',
-          date: 'Pending approval',
-        );
-      }
       return (
         label: 'Return status',
         date: _humanizeStatus(status ?? order.orderStatus),
+      );
+    }
+
+    if (order.hasReturnFailed || order.canReattemptReturn) {
+      return (
+        label: 'Return status',
+        date: 'Return Failed',
       );
     }
 
@@ -202,16 +287,7 @@ class UserOrderMapper {
     OrderHistoryItem order,
     List<OrderHistoryLineItem> items,
   ) {
-    if (order.isSubscription || items.length > 1) {
-      return 'No of Garments';
-    }
-
-    final size = items.firstOrNull?.size?.trim();
-    if (size != null && size.isNotEmpty) return 'Size';
-
-    if (order.resolvedKitDurationDays != null) return 'Duration';
-
-    return 'Quantity';
+    return 'No of Garments';
   }
 
   static String _attributeValue(
@@ -219,25 +295,34 @@ class UserOrderMapper {
     List<OrderHistoryLineItem> items,
     int garmentCount,
   ) {
-    if (order.isSubscription || items.length > 1) {
-      return garmentCount.toString();
-    }
-
-    final size = items.firstOrNull?.size?.trim();
-    if (size != null && size.isNotEmpty) return size;
-
-    final duration = order.resolvedKitDurationDays;
-    if (duration != null && duration > 0) {
-      return duration == 1 ? '1 day' : '$duration days';
-    }
-
-    return garmentCount.toString();
+    return garmentCount > 0 ? garmentCount.toString() : '1';
   }
 
   static ({String label, String lines, String mobile}) _resolveAddress(
     OrderHistoryItem order,
     Customer? customer,
   ) {
+    String? jsonAddress;
+    String? jsonMobile;
+    String? jsonType;
+
+    final rawJson = order.deliveryAddressJson?.trim();
+    if (rawJson != null && rawJson.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(rawJson);
+        if (decoded is Map) {
+          jsonAddress = decoded['full_address']?.toString() ??
+              decoded['fullAddress']?.toString() ??
+              decoded['address']?.toString();
+          jsonMobile = decoded['mobile']?.toString() ??
+              decoded['phone']?.toString();
+          jsonType = decoded['address_type']?.toString() ??
+              decoded['addressType']?.toString() ??
+              decoded['type']?.toString();
+        }
+      } catch (_) {}
+    }
+
     final addressId = order.resolvedCustomerAddressId;
     CustomerAddress? matched;
 
@@ -252,15 +337,31 @@ class UserOrderMapper {
 
     matched ??= customer?.primaryAddress;
 
-    final lines = _formatAddressLines(matched);
-    final label = matched?.city?.trim().isNotEmpty == true
-        ? matched!.city!.trim()
-        : 'Home';
+    var lines = _formatAddressLines(matched);
+    if (lines.isEmpty) {
+      lines = (jsonAddress != null && jsonAddress.trim().isNotEmpty)
+          ? jsonAddress.trim()
+          : (order.deliveryAddress?.trim().isNotEmpty == true
+              ? order.deliveryAddress!.trim()
+              : (order.deliveryAddressSnapshot?.trim() ?? ''));
+    }
+
+    var label = (jsonType != null && jsonType.trim().isNotEmpty)
+        ? jsonType.trim()
+        : (matched?.city?.trim().isNotEmpty == true
+            ? matched!.city!.trim()
+            : 'Home');
+
+    var mobile = (jsonMobile != null && jsonMobile.trim().isNotEmpty)
+        ? jsonMobile.trim()
+        : (customer?.mobile?.trim().isNotEmpty == true
+            ? customer!.mobile!.trim()
+            : '');
 
     return (
       label: label,
       lines: lines,
-      mobile: customer?.mobile ?? '',
+      mobile: mobile,
     );
   }
 

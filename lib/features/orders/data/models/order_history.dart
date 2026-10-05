@@ -6,12 +6,16 @@ class OrderPickupDetails {
     this.pickupDate,
     this.pickupTime,
     this.note,
+    this.fullName,
+    this.mobile,
   });
 
   final String? addressId;
   final String? pickupDate;
   final String? pickupTime;
   final String? note;
+  final String? fullName;
+  final String? mobile;
 
   factory OrderPickupDetails.fromJson(Map<String, dynamic> json) {
     return OrderPickupDetails(
@@ -22,6 +26,8 @@ class OrderPickupDetails {
       pickupTime: json['pickup_time']?.toString() ??
           json['pickupTime']?.toString(),
       note: json['note']?.toString(),
+      fullName: json['fullName']?.toString() ?? json['full_name']?.toString(),
+      mobile: json['mobile']?.toString() ?? json['phone']?.toString(),
     );
   }
 }
@@ -54,6 +60,23 @@ class OrderHistoryItem {
     this.returnDeliveryPartnerName,
     this.returnDeliveryPartnerPhone,
     this.pickupDetails,
+    this.subtotal = 0,
+    this.deliveryCharge = 0,
+    this.taxAmount = 0,
+    this.discountAmount = 0,
+    this.securityDepositAmount = 0,
+    this.securityDepositRefundStatus,
+    this.securityDepositRefundAmount = 0,
+    this.razorpayPaymentId,
+    this.razorpayOrderId,
+    this.deliveryAddress,
+    this.deliveryAddressSnapshot,
+    this.deliveryAddressJson,
+    this.customerAddress,
+    this.canReattemptReturn = false,
+    this.rejectionReason,
+    this.isReturnWaitlisted = false,
+    this.refundStatus,
   });
 
   final String id;
@@ -82,6 +105,23 @@ class OrderHistoryItem {
   final String? returnDeliveryPartnerName;
   final String? returnDeliveryPartnerPhone;
   final OrderPickupDetails? pickupDetails;
+  final num subtotal;
+  final num deliveryCharge;
+  final num taxAmount;
+  final num discountAmount;
+  final num securityDepositAmount;
+  final String? securityDepositRefundStatus;
+  final num securityDepositRefundAmount;
+  final String? razorpayPaymentId;
+  final String? razorpayOrderId;
+  final String? deliveryAddress;
+  final String? deliveryAddressSnapshot;
+  final String? deliveryAddressJson;
+  final String? customerAddress;
+  final bool canReattemptReturn;
+  final String? rejectionReason;
+  final bool isReturnWaitlisted;
+  final String? refundStatus;
 
   static const _returnFlowStatuses = {
     'RETURN_REQUESTED',
@@ -120,7 +160,25 @@ class OrderHistoryItem {
     );
   }
 
+  /// A later successful drop-off overrides an earlier failed pickup.
+  bool get isReturnSettled {
+    final status = orderStatus?.trim().toUpperCase() ?? '';
+    final rs = returnStatus?.trim().toUpperCase() ?? '';
+    const settled = {'RETURNED', 'RETURNED_TO_IAP'};
+    return settled.contains(status) || settled.contains(rs);
+  }
+
+  bool get hasReturnFailed {
+    if (isReturnSettled) return false;
+    final status = orderStatus?.trim().toUpperCase() ?? '';
+    final rs = returnStatus?.trim().toUpperCase() ?? '';
+    if (status == 'RETURN_FAILED' || rs == 'RETURN_FAILED') return true;
+    if (statusHistory.isEmpty) return false;
+    return statusHistory.last.status.trim().toUpperCase() == 'RETURN_FAILED';
+  }
+
   bool get isInReturnFlow {
+    if (canReattemptReturn || hasReturnFailed) return false;
     final status = orderStatus?.trim().toUpperCase() ?? '';
     if (_returnFlowStatuses.contains(status)) return true;
     final rs = returnStatus?.trim().toUpperCase();
@@ -131,6 +189,7 @@ class OrderHistoryItem {
   /// True once Super Admin has approved the return (or return is underway).
   /// Waitlisted / pending requests should NOT show return timeline steps yet.
   bool get shouldShowReturnTimeline {
+    if (canReattemptReturn || hasReturnFailed) return false;
     if (!isDelivered && !_returnFlowStatuses.contains(
           orderStatus?.trim().toUpperCase() ?? '',
         )) {
@@ -151,6 +210,7 @@ class OrderHistoryItem {
 
   /// Effective status for tracking UI (prefers return status once approved).
   String get trackingCurrentStatus {
+    if (hasReturnFailed) return 'RETURN_FAILED';
     final order = normalizedOrderStatus;
     if (_returnFlowStatuses.contains(order)) return order;
     final rs = returnStatus?.trim().toUpperCase() ?? '';
@@ -166,6 +226,7 @@ class OrderHistoryItem {
   }
 
   bool get isReturnComplete {
+    if (hasReturnFailed) return false;
     if (returnedAt != null) return true;
     final status = orderStatus?.trim().toUpperCase() ?? '';
     if (status == 'RETURNED' ||
@@ -181,7 +242,9 @@ class OrderHistoryItem {
       orderType?.trim().toUpperCase() == 'SUBSCRIPTION';
 
   bool get canReturn {
-    if (!isDelivered || returnedAt != null || isReturnComplete) return false;
+    if (returnedAt != null || isReturnComplete) return false;
+    if (canReattemptReturn || hasReturnFailed) return true;
+    if (!isDelivered) return false;
     final rs = returnStatus?.trim().toUpperCase();
     if (rs == null || rs.isEmpty) return true;
     return rs == 'ACTIVE';
@@ -295,10 +358,50 @@ class OrderHistoryItem {
       pickupDetails: _parsePickupDetails(
         json['pickup_details'] ?? json['pickupDetails'],
       ),
+      subtotal: _num(json['subtotal']),
+      deliveryCharge: _num(json['delivery_charge'] ?? json['deliveryCharge']),
+      taxAmount: _num(json['tax_amount'] ?? json['taxAmount']),
+      discountAmount: _num(json['discount_amount'] ?? json['discountAmount']),
+      securityDepositAmount: _num(
+        json['security_deposit_amount'] ?? json['securityDepositAmount'],
+      ),
+      securityDepositRefundStatus:
+          json['security_deposit_refund_status']?.toString() ??
+          json['securityDepositRefundStatus']?.toString(),
+      securityDepositRefundAmount: _num(
+        json['security_deposit_refund_amount'] ??
+        json['securityDepositRefundAmount'],
+      ),
+      razorpayPaymentId: json['razorpay_payment_id']?.toString() ??
+          json['razorpayPaymentId']?.toString(),
+      razorpayOrderId: json['razorpay_order_id']?.toString() ??
+          json['razorpayOrderId']?.toString(),
+      deliveryAddress: json['delivery_address']?.toString() ??
+          json['address']?.toString(),
+      deliveryAddressSnapshot: json['delivery_address_snapshot']?.toString(),
+      deliveryAddressJson: json['delivery_address_json']?.toString(),
+      customerAddress: json['customer_address']?.toString(),
+      canReattemptReturn: json['can_reattempt_return'] == true ||
+          json['canReattemptReturn'] == true ||
+          json['can_reattempt_return']?.toString() == '1',
+      rejectionReason: json['rejection_reason']?.toString() ??
+          json['rejectionReason']?.toString(),
+      isReturnWaitlisted: _bool(
+        json['is_return_waitlisted'] ?? json['isReturnWaitlisted'],
+      ),
+      refundStatus: json['refund_status']?.toString() ??
+          json['refundStatus']?.toString(),
     );
   }
 
   static OrderPickupDetails? _parsePickupDetails(dynamic raw) {
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        raw = jsonDecode(raw);
+      } catch (_) {
+        return null;
+      }
+    }
     if (raw is! Map) return null;
     return OrderPickupDetails.fromJson(Map<String, dynamic>.from(raw));
   }
@@ -361,6 +464,12 @@ class OrderHistoryItem {
   static int? _int(dynamic value) {
     if (value is int) return value;
     return int.tryParse(value?.toString() ?? '');
+  }
+
+  static bool _bool(dynamic value) {
+    if (value == true || value == 1) return true;
+    final text = value?.toString().trim().toLowerCase();
+    return text == 'true' || text == '1';
   }
 
   static DateTime? _dateTime(dynamic value) {
@@ -532,6 +641,7 @@ class OrderLineKitDetails {
     this.durationDays,
     this.height,
     this.weight,
+    this.price = 0,
     this.selectedItems = const [],
   });
 
@@ -544,6 +654,7 @@ class OrderLineKitDetails {
   final int? durationDays;
   final String? height;
   final String? weight;
+  final num price;
   final List<OrderKitSelectedItem> selectedItems;
 
   factory OrderLineKitDetails.fromJson(Map<String, dynamic> json) {
@@ -562,6 +673,7 @@ class OrderLineKitDetails {
       ),
       height: json['height']?.toString(),
       weight: json['weight']?.toString(),
+      price: OrderHistoryItem._num(json['price'] ?? json['kit_price']),
       selectedItems: _parseSelectedItems(
         json['selectedItems'] ?? json['selected_items'],
       ),

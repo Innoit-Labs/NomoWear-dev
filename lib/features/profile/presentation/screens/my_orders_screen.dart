@@ -339,11 +339,33 @@ class _OrderListTile extends StatelessWidget {
           width: double.infinity,
           height: 38.h,
           child: OutlinedButton(
-            onPressed: () => Navigator.pushNamed(
-              context,
-              AppRoutes.orderTrackingScreen,
-              arguments: order.id,
-            ),
+            onPressed: () async {
+              if (!order.canReturn) {
+                Navigator.pushNamed(
+                  context,
+                  AppRoutes.orderTrackingScreen,
+                  arguments: order.id,
+                );
+                return;
+              }
+              final submitted = await Navigator.pushNamed(
+                context,
+                AppRoutes.returnOrderScreen,
+                arguments: {
+                  'orderId': order.id,
+                  'orderNumber': order.orderIdDisplay,
+                },
+              );
+              if (submitted == true && context.mounted) {
+                await onReturnSubmitted?.call();
+                if (!context.mounted) return;
+                Navigator.pushNamed(
+                  context,
+                  AppRoutes.orderTrackingScreen,
+                  arguments: order.id,
+                );
+              }
+            },
             style: OutlinedButton.styleFrom(
               side: BorderSide(
                 color: AppColours.primary.withOpacity(0.45),
@@ -355,7 +377,7 @@ class _OrderListTile extends StatelessWidget {
               padding: EdgeInsets.zero,
             ),
             child: Text(
-              'Track Your Order',
+              order.actionLabel,
               style: CustomTextStyles.openSansSemiBold.copyWith(
                 fontSize: 11.fSize,
                 color: Colors.white,
@@ -465,7 +487,7 @@ class _OrderListTile extends StatelessWidget {
                     ),
                   ),
                   child: Text(
-                    'Return This Order',
+                    order.actionLabel,
                     style: TextStyle(
                       color: Colors.black,
                       fontSize: 13.fSize,
@@ -491,9 +513,7 @@ class _OrderListTile extends StatelessWidget {
                         ),
                       ),
                       child: Text(
-                        order.isInReturnFlow
-                            ? 'Track Return'
-                            : 'Track Your Order',
+                        order.actionLabel,
                         style: CustomTextStyles.openSansSemiBold.copyWith(
                           fontSize: 10,
                           color: order.isInReturnFlow

@@ -2,12 +2,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:nomowear/core/app_export.dart';
-import 'package:nomowear/features/cart/data/models/remote_cart.dart';
+import 'package:nomowear/core/utils/kids_size_utils.dart';
 import 'package:nomowear/features/cart/presentation/bloc/cart_bloc.dart';
 
 import 'package:nomowear/features/cart/presentation/widgets/cart_quantity_control.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
+import 'package:nomowear/features/products/data/product_catalog.dart';
 import 'package:nomowear/features/products/data/product_mapper.dart';
 import 'package:nomowear/features/products/data/product_repository.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/product_details_screen.dart';
@@ -16,6 +17,8 @@ import 'package:nomowear/features/checkout/presentation/utils/checkout_pricing.d
 import 'package:nomowear/features/products/data/models/product.dart';
 
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
+
+import '../../../products/data/product_catalog.dart';
 
 class ReusableProductCartItem extends StatefulWidget {
   final CartItem item;
@@ -186,16 +189,28 @@ class _ReusableProductCartItemState extends State<ReusableProductCartItem> {
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             Flexible(
-                              child: Text(
-                                currentColor != null
-                                    ? 'Size: ${item.selectedSize} / Color: $currentColor'
-                                    : 'Size: ${item.selectedSize}',
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 12.fSize,
-                                ),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
+                              child: Builder(
+                                builder: (_) {
+                                  final isKids = widget.item.isKids ||
+                                      (widget.item.category?.toLowerCase().contains('kids') ?? false) ||
+                                      (_product != null && ProductCatalog.isKidsProduct(_product!)) ||
+                                      isKidsAgeSize(widget.item.selectedSize);
+                                  final displaySize = isKids
+                                      ? formatKidsSize(widget.item.selectedSize)
+                                      : widget.item.selectedSize;
+
+                                  return Text(
+                                    currentColor != null
+                                        ? 'Size: $displaySize / Color: $currentColor'
+                                        : 'Size: $displaySize',
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 12.fSize,
+                                    ),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  );
+                                },
                               ),
                             ),
                             SizedBox(width: 4.w),
@@ -211,6 +226,7 @@ class _ReusableProductCartItemState extends State<ReusableProductCartItem> {
                       child: CartQuantityControl(
                         state: state,
                         item: item,
+                        variant: variant,
                       ),
                     ),
                   ],
@@ -219,27 +235,14 @@ class _ReusableProductCartItemState extends State<ReusableProductCartItem> {
             ),
           ),
           GestureDetector(
-            onTap: state.isLinePending(item.id)
-                ? null
-                : () => context
-                    .read<CartBloc>()
-                    .add(RemoveFromCartEvent(item.id)),
-            child: state.isLinePending(item.id)
-                ? Padding(
-                    padding: EdgeInsets.only(top: 4.h),
-                    child: SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: AppColours.primary,
-                      ),
-                    ),
-                  )
-                : Padding(
-                    padding: EdgeInsets.only(top: 4.h),
-                    child: SvgPicture.asset(IconConstant.delete1),
-                  ),
+            onTap: () => context
+                .read<CartBloc>()
+                .add(RemoveFromCartEvent(item.id)),
+            behavior: HitTestBehavior.opaque,
+            child: Padding(
+              padding: EdgeInsets.only(top: 4.h, left: 6.w, right: 2.w, bottom: 6.h),
+              child: SvgPicture.asset(IconConstant.delete1),
+            ),
           ),
         ],
       ),

@@ -3,6 +3,7 @@ import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/services/auth_storage.dart';
 import 'package:nomowear/core/utils/api_id_utils.dart';
+import 'package:nomowear/core/utils/kids_size_utils.dart';
 import 'package:nomowear/features/products/data/models/product.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
 import 'package:nomowear/features/products/data/product_catalog.dart';
@@ -34,8 +35,11 @@ String _normalizeAgeLabel(String value) {
       .replaceAll(RegExp(r'\s+'), '');
 }
 
-/// Parses labels like `0-6M`, `2-4Y`, `2-3 Y` into inclusive month bounds.
+/// Parses labels like `0-6M`, `2-4Y`, `2-3 Y`, `1-3 years` into inclusive month bounds.
 (int minMonths, int maxMonths)? _ageLabelToMonths(String value) {
+  final r = kidsSizeToMonthRange(value);
+  if (r.$1 != 999) return r;
+
   final normalized = _normalizeAgeLabel(value);
   final match = RegExp(r'^(\d+)-(\d+)([my])$').firstMatch(normalized);
   if (match == null) return null;
@@ -464,6 +468,9 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
     required int apiCount,
     required int page,
   }) {
+    for (final p in products) {
+      ProductCache.instance.upsert(p);
+    }
     final listing = ProductCatalog.wardrobeListingItems(
       products,
       widget.category,
@@ -966,7 +973,11 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
     );
   }
 
+  bool get _shouldShowPrice =>
+      ProductCatalog.shouldShowPrice(category: widget.category);
+
   Widget _buildPriceRow(ResolvedPrice prices) {
+    if (!_shouldShowPrice) return const SizedBox.shrink();
     if (prices.hasDiscount) {
       return Row(
         mainAxisSize: MainAxisSize.min,
@@ -1148,8 +1159,10 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
                 fontSize: 11.fSize,
               ),
             ),
-            SizedBox(height: 4.h),
-            _buildPriceRow(ProductMapper.resolvePrice(item, variant: _defaultVariantForItem(item))),
+            if (_shouldShowPrice) ...[
+              SizedBox(height: 4.h),
+              _buildPriceRow(ProductMapper.resolvePrice(item, variant: _defaultVariantForItem(item))),
+            ],
             SizedBox(height: 8.h),
             BlocBuilder<CartBloc, CartState>(
               buildWhen: (previous, current) {
@@ -1300,23 +1313,14 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
                         Expanded(
                           flex: 2,
                           child: Center(
-                            child: pending
-                                ? SizedBox(
-                                    width: 14.fSize,
-                                    height: 14.fSize,
-                                    child: const CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Color(0xFFE6C27A),
-                                    ),
-                                  )
-                                : Text(
-                                    '$qty',
-                                    style: TextStyle(
-                                      color: AppColours.primary,
-                                      fontSize: 12.fSize,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
+                            child: Text(
+                              '$qty',
+                              style: TextStyle(
+                                color: AppColours.primary,
+                                fontSize: 12.fSize,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
                           ),
                         ),
                         Container(width: 1, color: const Color(0xFFE6C27A).withOpacity(0.35)),
@@ -1324,6 +1328,12 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
                           child: InkWell(
                             borderRadius: const BorderRadius.horizontal(right: Radius.circular(12)),
                             onTap: () async {
+                              if (existingLine != null) {
+                                final added = tryAddToCart(context, existingLine);
+                                if (!added) return;
+                                return;
+                              }
+
                               final itemType =
                                   CartLimits.cartItemTypeForListing(
                                       itemType: item.itemType);
@@ -1331,12 +1341,37 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
                               ProductVariant? selectedVariant = variant;
                               String? finalSize = existingLine?.selectedSize ?? _selectedSizeForItem(item, variant);
                               
-                              final product = ProductCache.instance.findById(item.productId ?? '');
-                              if (product != null && (product.hasVariants || product.variants.isNotEmpty)) {
+                              var product = ProductCache.instance.findById(item.productId ?? '');
+                              if (product == null && isApiUuid(item.productId)) {
+                                if (item.variants.isNotEmpty) {
+                                  product = Product(
+                                    id: item.productId!,
+                                    productName: item.title,
+                                    productSlug: item.productId!,
+                                    productClass: 'single_item',
+                                    hasVariants: item.variants.isNotEmpty,
+                                    categoryName: item.category ?? widget.category,
+                                    primaryImageUrl: item.imageUrl,
+                                    imageUrls: item.imageUrls,
+                                    variants: item.variants,
+                                    actualPrice: item.actualPrice ?? item.price ?? '0',
+                                    costPrice: item.costPrice,
+                                    itemType: item.itemType ?? '',
+                                    stockStatus: item.stockStatus,
+                                  );
+                                  ProductCache.instance.upsert(product);
+                                } else {
+                                  try {
+                                    product = await _productRepository.getProductById(item.productId!);
+                                  } catch (_) {}
+                                }
+                              }
+
+                              if (product != null && product.variants.isNotEmpty) {
                                 final result = await VariantSelectionSheet.show(context, product);
                                 if (result == null) return;
                                 selectedVariant = result;
-                                finalSize = ProductMapper.optionValue(result, 'Size');
+                                finalSize = ProductMapper.optionValue(result, 'Size') ?? finalSize;
                               }
 
                               final isKids = itemType == 'kids' ||
@@ -1352,13 +1387,13 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
 
                               final prices = ProductMapper.resolvePrice(item, variant: selectedVariant);
                               final cartItem = CartItem(
-                                id: itemId,
                                 productId: productId,
                                 variantId: isApiUuid(selectedVariant?.id) ? selectedVariant!.id : null,
                                 title: item.title,
                                 imageUrl: item.imageUrl,
                                 price: prices.discountedPrice,
-                                selectedSize: finalSize ?? '',
+                                selectedSize:
+                                    isKids ? formatKidsSize(finalSize) : finalSize,
                                 quantity: 1,
                                 isEssential: isEssential,
                                 isKids: isKids,
@@ -1402,12 +1437,37 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
                       ProductVariant? selectedVariant = variant;
                       String? finalSize = _selectedSizeForItem(item, variant);
 
-                      final product = ProductCache.instance.findById(item.productId ?? '');
-                      if (product != null && (product.hasVariants || product.variants.isNotEmpty)) {
+                      var product = ProductCache.instance.findById(item.productId ?? '');
+                      if (product == null && isApiUuid(item.productId)) {
+                        if (item.variants.isNotEmpty) {
+                          product = Product(
+                            id: item.productId!,
+                            productName: item.title,
+                            productSlug: item.productId!,
+                            productClass: 'single_item',
+                            hasVariants: item.variants.isNotEmpty,
+                            categoryName: item.category ?? widget.category,
+                            primaryImageUrl: item.imageUrl,
+                            imageUrls: item.imageUrls,
+                            variants: item.variants,
+                            actualPrice: item.actualPrice ?? item.price ?? '0',
+                            costPrice: item.costPrice,
+                            itemType: item.itemType ?? '',
+                            stockStatus: item.stockStatus,
+                          );
+                          ProductCache.instance.upsert(product);
+                        } else {
+                          try {
+                            product = await _productRepository.getProductById(item.productId!);
+                          } catch (_) {}
+                        }
+                      }
+
+                      if (product != null && product.variants.isNotEmpty) {
                         final result = await VariantSelectionSheet.show(context, product);
                         if (result == null) return; // User closed sheet
                         selectedVariant = result;
-                        finalSize = ProductMapper.optionValue(result, 'Size');
+                        finalSize = ProductMapper.optionValue(result, 'Size') ?? finalSize;
                       }
 
                       final isKids = itemType == 'kids' ||
@@ -1423,13 +1483,13 @@ class _WardrobeScreenState extends State<WardrobeScreen> {
 
                       final prices = ProductMapper.resolvePrice(item, variant: selectedVariant);
                       final cartItem = CartItem(
-                        id: itemId,
                         productId: productId,
                         variantId: isApiUuid(selectedVariant?.id) ? selectedVariant!.id : null,
                         title: item.title,
                         imageUrl: item.imageUrl,
                         price: prices.discountedPrice,
-                        selectedSize: finalSize ?? '',
+                        selectedSize:
+                            isKids ? formatKidsSize(finalSize) : finalSize,
                         isEssential: isEssential,
                         isKids: isKids,
                         isSubscriptionGarment: !isEssential && effectiveItemType == 'subscription',

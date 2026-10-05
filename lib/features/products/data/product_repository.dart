@@ -3,7 +3,6 @@ import 'package:nomowear/core/network/api_client.dart';
 import 'package:nomowear/core/network/api_constants.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/services/auth_storage.dart';
-import 'package:nomowear/features/auth/data/models/customer.dart';
 import 'package:nomowear/features/checkout/data/checkout_session.dart';
 import 'package:nomowear/features/products/data/models/product.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
@@ -62,7 +61,10 @@ class ProductRepository {
     final actionParam = action?.trim().toLowerCase();
     final ageParam = age?.trim();
     final genderParam = gender?.trim();
-    final tabParam = tab?.trim();
+    var tabParam = tab?.trim();
+    if (tabParam != null && tabParam.toLowerCase() == 'kidswardrobe') {
+      tabParam = 'Kids Wardrobe';
+    }
     final hasAction =
         actionParam != null &&
         actionParam.isNotEmpty &&
@@ -255,10 +257,10 @@ class ProductRepository {
               // 4. Google Maps geocode fallback
               // Use the address text from the matched address, or fall back to
               // CheckoutSession.addressLines (set from the Kit screen NEXT button).
-              final addressText = selectedAddress?.addressLines?.trim().isNotEmpty == true
-                  ? selectedAddress!.addressLines
-                  : selectedAddress?.title?.trim().isNotEmpty == true
-                      ? selectedAddress!.title
+              final addressText = (selectedAddress != null && selectedAddress.addressLines.trim().isNotEmpty)
+                  ? selectedAddress.addressLines
+                  : (selectedAddress != null && selectedAddress.title.trim().isNotEmpty)
+                      ? selectedAddress.title
                       : CheckoutSession.instance.addressLines;
               if (addressText != null && addressText.isNotEmpty) {
                 try {
@@ -306,7 +308,7 @@ class ProductRepository {
         query['longitude'] = activeLongitude.toString();
         query['nearestOnly'] = 'true';
         apiPath = ApiConstants.productsNearbyPath;
-        if (limit == null || limit! <= 0) {
+        if ((limit ?? 0) <= 0) {
           limit = 50;
         }
       }
@@ -314,11 +316,12 @@ class ProductRepository {
       if (tabParam != null && tabParam.isNotEmpty) {
         query['tab'] = tabParam;
       }
-      if (page != null && page! > 0) {
+      if (page != null && page > 0) {
         query['page'] = '$page';
       }
-      if (limit != null && limit! > 0) {
-        query['limit'] = '$limit';
+      final finalLimit = limit;
+      if (finalLimit != null && finalLimit > 0) {
+        query['limit'] = '$finalLimit';
       }
       if (actionParam != null && actionParam.isNotEmpty) {
         query['action'] = actionParam;

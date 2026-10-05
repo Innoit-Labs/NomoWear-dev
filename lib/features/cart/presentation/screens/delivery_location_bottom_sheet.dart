@@ -700,7 +700,7 @@ class _DeliveryLocationBottomSheetState
       width: double.maxFinite,
       padding: EdgeInsets.fromLTRB(16.w, 12.h, 16.w, 28.h),
       child: Container(
-        height: 52.h,
+        height: 44.h,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(10),
           gradient: LinearGradient(

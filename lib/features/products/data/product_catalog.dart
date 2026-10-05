@@ -8,7 +8,7 @@ class ProductCatalog {
     'Comfort wardrobe',
     'Professional wardrobe',
     'Premium wardrobe',
-    'Kidswardrobe',
+    'Kids Wardrobe',
     'Essentialswardrobe',
   ];
 
@@ -24,7 +24,16 @@ class ProductCatalog {
   static bool isKidsProduct(Product product) {
     if (!product.isSingleItem) return false;
     final category = product.categoryName?.toLowerCase() ?? '';
-    return category == 'kidswardrobe' || category.contains('kids');
+    if (category == 'kids wardrobe' ||
+        category == 'kidswardrobe' ||
+        category.contains('kids')) {
+      return true;
+    }
+    final name = product.productName.toLowerCase();
+    if (RegExp(r'\b(kids?|boys?|girls?)\b').hasMatch(name)) {
+      return true;
+    }
+    return false;
   }
 
   static bool isEssentialsProduct(Product product) {
@@ -38,6 +47,27 @@ class ProductCatalog {
   /// Single items bought directly (essentials + kids), not via wardrobe kits.
   static bool isDirectPurchaseProduct(Product product) =>
       isEssentialsProduct(product) || isKidsProduct(product);
+
+  /// Returns whether prices should be displayed for a product or category.
+  /// Rental/subscription wardrobe categories (e.g. "Professional Wardrobe",
+  /// "Comfort Wardrobe", "Premium Wardrobe") do not show item prices because
+  /// they are rented as part of a wardrobe kit subscription.
+  /// Only direct-purchase items (Daily Essentials, Kids Wear) display prices.
+  static bool shouldShowPrice({String? category, Product? product}) {
+    final cat = (category ?? product?.categoryName ?? '').trim().toLowerCase();
+    if (cat.contains('professional') ||
+        cat.contains('comfort') ||
+        cat.contains('premium')) {
+      return false;
+    }
+    if (product != null && isDirectPurchaseProduct(product)) {
+      return true;
+    }
+    if (cat.contains('essential') || cat.contains('kid')) {
+      return true;
+    }
+    return false;
+  }
 
   /// Maps a display category (e.g. product name) to the backend `tab` value.
   static String? apiTabForCategory(String category) {

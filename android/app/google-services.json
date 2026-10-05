@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1021580036098",
+    "project_id": "nomowear",
+    "storage_bucket": "nomowear.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1021580036098:android:c1215e407f7350618a3f1b",
+        "android_client_info": {
+          "package_name": "com.nomowear"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB-WWVe7uunWj_1ZT62-Np6e2oD0hhpK-U"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

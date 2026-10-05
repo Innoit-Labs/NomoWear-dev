@@ -1,3 +1,4 @@
+import 'package:nomowear/core/utils/kids_size_utils.dart';
 import 'package:nomowear/features/products/data/models/product.dart';
 import 'package:nomowear/features/products/data/product_catalog.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
@@ -258,14 +259,45 @@ class ProductMapper {
         return entry.value.trim();
       }
     }
+    // Check aliases
+    final lowerKey = key.toLowerCase();
+    if (lowerKey == 'size') {
+      for (final entry in variant.options.entries) {
+        final k = entry.key.toLowerCase();
+        if (k == 'age' || k == 'ages' || k == 'sizes') {
+          return entry.value.trim();
+        }
+      }
+    } else if (lowerKey == 'color') {
+      for (final entry in variant.options.entries) {
+        final k = entry.key.toLowerCase();
+        if (k == 'colour' || k == 'colors' || k == 'colours') {
+          return entry.value.trim();
+        }
+      }
+    }
+
     final name = variant.variantName;
     if (name.isNotEmpty) {
-      final parts = name.split('/');
+      final parts = name.split(RegExp(r'[/,|]')).map((s) => s.trim()).toList();
       for (final part in parts) {
-        final kv = part.split(':');
-        if (kv.length >= 2) {
-          if (kv[0].trim().toLowerCase() == key.toLowerCase()) {
+        if (part.contains(':')) {
+          final kv = part.split(':');
+          if (kv.length >= 2 && kv[0].trim().toLowerCase() == lowerKey) {
             return kv.sublist(1).join(':').trim();
+          }
+        } else {
+          final upper = part.toUpperCase();
+          if (lowerKey == 'size') {
+            const sizeKeywords = {'XS', 'S', 'M', 'L', 'XL', 'XXL', 'XXXL', 'FREE SIZE', 'FS'};
+            final isAge = RegExp(r'^\d+\s*-\s*\d+\s*(M|Y|Months?|Years?)?$', caseSensitive: false).hasMatch(part);
+            if (sizeKeywords.contains(upper) || isAge) {
+              return part;
+            }
+          } else if (lowerKey == 'color') {
+            if (!part.contains(RegExp(r'\d')) && part.length < 25 && upper != 'M' && upper != 'S' && upper != 'L' && upper != 'XL') {
+              return part;
+            }
           }
         }
       }
@@ -292,7 +324,9 @@ class ProductMapper {
       final colorMatches = wantedColor == null ||
           wantedColor.isEmpty ||
           color == wantedColor;
-      final sizeMatches = size == null || size == wantedSize;
+      final sizeMatches = size == null ||
+          size == wantedSize ||
+          areKidsSizesEquivalent(size, wantedSize);
 
       if (colorMatches && sizeMatches) return variant;
     }
@@ -300,7 +334,9 @@ class ProductMapper {
     // Fallback 1: keep size, ignore color.
     for (final variant in variants) {
       final size = optionValue(variant, 'Size')?.toUpperCase();
-      if (size == wantedSize) return variant;
+      if (size == wantedSize || areKidsSizesEquivalent(size, wantedSize)) {
+        return variant;
+      }
     }
 
     // Fallback 2: keep color, ignore size.

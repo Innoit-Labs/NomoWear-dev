@@ -10,6 +10,7 @@ class RemoteCartKitDetails {
     this.weight,
     this.wardrobeKitId,
     this.wardrobeKitProductId,
+    this.wardrobeKitVariantId,
     this.durationDays,
     this.selectedItems,
   });
@@ -24,6 +25,7 @@ class RemoteCartKitDetails {
   final String? weight;
   final String? wardrobeKitId;
   final String? wardrobeKitProductId;
+  final String? wardrobeKitVariantId;
   final int? durationDays;
   final List<dynamic>? selectedItems;
 
@@ -52,11 +54,16 @@ class RemoteCartKitDetails {
     if (wardrobeKitProductId != null && wardrobeKitProductId!.isNotEmpty) {
       map['wardrobe_kit_product_id'] = wardrobeKitProductId;
     }
+    if (wardrobeKitVariantId != null && wardrobeKitVariantId!.isNotEmpty) {
+      map['wardrobe_kit_variant_id'] = wardrobeKitVariantId;
+    }
     if (durationDays != null && durationDays! > 0) {
       map['duration_days'] = durationDays;
       map['durationDays'] = durationDays;
     }
-    if (selectedItems != null && selectedItems!.isNotEmpty) {
+    // Always send selectedItems when provided — including [] so a kit clear
+    // replaces garments instead of leaving the previous selection on the server.
+    if (selectedItems != null) {
       map['selectedItems'] = selectedItems;
     }
     return map;
@@ -139,18 +146,25 @@ class RemoteCartItem {
               wardrobeKitId: _nonEmpty(
                 kitRaw['wardrobe_kit_id'] ??
                     kitRaw['wardrobeKitId'] ??
-                    kitRaw['kitId'],
+                    kitRaw['kitId'] ??
+                    kitRaw['selectedKitId'] ??
+                    kitRaw['selected_kit_id'],
               ),
               wardrobeKitProductId: _nonEmpty(
                 kitRaw['wardrobe_kit_product_id'] ??
                     kitRaw['wardrobeKitProductId'],
               ),
+              wardrobeKitVariantId: _nonEmpty(
+                kitRaw['wardrobe_kit_variant_id'] ??
+                    kitRaw['wardrobeKitVariantId'],
+              ),
               durationDays: _parseInt(
                 kitRaw['duration_days'] ?? kitRaw['durationDays'],
               ),
-              selectedItems: kitRaw['selectedItems'] is List
-                  ? List.from(kitRaw['selectedItems'] as List)
-                  : null,
+              selectedItems: () {
+                final raw = kitRaw['selectedItems'] ?? kitRaw['selected_items'];
+                return raw is List ? List.from(raw) : null;
+              }(),
             )
           : null,
     );
@@ -174,6 +188,8 @@ class RemoteCart {
     this.nonSubscriptionCount = 0,
     this.essentialsCount = 0,
     this.kidsCount = 0,
+    this.activeKitPrice = 0,
+    this.securityDepositAmount = 0,
   });
 
   final String id;
@@ -191,6 +207,8 @@ class RemoteCart {
   final int nonSubscriptionCount;
   final int essentialsCount;
   final int kidsCount;
+  final num activeKitPrice;
+  final num securityDepositAmount;
 
   bool get isEmpty => itemCount <= 0 && items.isEmpty;
 
@@ -203,27 +221,85 @@ class RemoteCart {
     final sectionItems = _itemsFromSections(sectionsRaw);
     final items = _canonicalCartLines(cartItems, sectionItems);
 
-    int sectionCount(String key) {
-      if (sectionsRaw is! Map) return 0;
-      final block = sectionsRaw[key];
-      if (block is! Map) return 0;
-      final listed = block['item_count'] ?? block['itemCount'];
-      if (listed is num) return listed.toInt();
-      final list = block['items'];
-      if (list is List) {
-        return list.fold<int>(0, (sum, row) {
-          if (row is! Map) return sum;
-          return sum + (_parseInt(row['quantity']) ?? 0);
-        });
+    // Determine canonical kit prices if any active wardrobe kits exist
+    num activeKitPrice = 0;
+    num activeKitPreAuth = 0;
+    final rawCartItems = json['cartItems'] ?? json['cart_items'] ?? json['items'];
+    if (rawCartItems is List) {
+      for (final raw in rawCartItems) {
+        if (raw is Map) {
+          final kitRaw = raw['kitDetails'] ?? raw['kit_details'];
+          if (kitRaw is Map &&
+              (kitRaw['selectedItems'] is List ||
+                  kitRaw['selected_items'] is List)) {
+            final p = _parseNum(raw['unitPrice'] ?? raw['unit_price'] ?? raw['price'] ?? kitRaw['price'] ?? kitRaw['kit_price']);
+            if (p != null && p > 0) activeKitPrice = p;
+            final preAuth = _parseNum(raw['pre_auth_amount'] ?? raw['current_amount'] ?? kitRaw['pre_auth_amount']);
+            if (preAuth != null && preAuth > 0) activeKitPreAuth = preAuth;
+          }
+        }
       }
-      return 0;
     }
 
-    final summaryCount = summary is Map
-        ? _parseInt(summary['item_count'] ?? summary['itemCount'])
-        : null;
-    final topCount = _parseInt(json['item_count'] ?? json['itemCount']);
+    final hasPaidWardrobe = items.any((it) => it.itemType == 'non_subscription');
+    final directItemsTotal = items
+        .where((it) => it.itemType != 'subscription' && it.itemType != 'non_subscription')
+        .fold<num>(0, (sum, it) => sum + (it.unitPrice > 0 ? it.unitPrice * it.quantity : it.lineTotal));
+
+    final rawSubtotal = _parseNum(json['subtotal']) ?? 0;
+    num canonicalSubtotal = rawSubtotal;
+    if (hasPaidWardrobe && activeKitPrice > 0) {
+      final expectedSubtotal = activeKitPrice + directItemsTotal;
+      if (rawSubtotal > expectedSubtotal) {
+        canonicalSubtotal = expectedSubtotal;
+      }
+    } else if (!hasPaidWardrobe && items.isNotEmpty) {
+      canonicalSubtotal = directItemsTotal;
+    }
+
+    final rawTax = _parseNum(json['tax_amount'] ?? json['taxAmount']) ?? 0;
+    num canonicalTax = rawTax;
+    if (rawSubtotal > 0 && canonicalSubtotal < rawSubtotal) {
+      canonicalTax = (canonicalSubtotal * (rawTax / rawSubtotal)).roundToDouble();
+    }
+
+    final rawDelivery = _parseNum(json['delivery_charge'] ?? json['deliveryCharge']) ?? 0;
+    final rawDiscount = _parseNum(
+      json['discount_amount'] ??
+          json['discountAmount'] ??
+          (summary is Map
+              ? (summary['discount_amount'] ?? summary['discountAmount'])
+              : null),
+    ) ?? 0;
+
+    final rawTotal = _parseNum(json['total_amount'] ?? json['totalAmount']) ?? 0;
+    num canonicalTotal = rawTotal;
+    if (rawSubtotal > 0 && canonicalSubtotal < rawSubtotal) {
+      final orderTotal = canonicalSubtotal + rawDelivery + canonicalTax - rawDiscount;
+      canonicalTotal = orderTotal + activeKitPreAuth;
+    }
+
+    final subCount = items.where((it) => it.itemType == 'subscription').fold<int>(0, (s, i) => s + i.quantity);
+    final nonSubCount = items.where((it) => it.itemType == 'non_subscription').fold<int>(0, (s, i) => s + i.quantity);
+    final essCount = items.where((it) => it.itemType == 'essentials').fold<int>(0, (s, i) => s + i.quantity);
+    final kdCount = items.where((it) => it.itemType == 'kids').fold<int>(0, (s, i) => s + i.quantity);
     final qtySum = items.fold<int>(0, (sum, item) => sum + item.quantity);
+
+    final topLevelDeposit = _parseNum(
+      json['security_deposit_amount'] ??
+          json['securityDepositAmount'] ??
+          json['security_deposit'] ??
+          json['securityDeposit'] ??
+          (summary is Map
+              ? (summary['security_deposit_amount'] ??
+                  summary['securityDepositAmount'] ??
+                  summary['security_deposit'] ??
+                  summary['securityDeposit'] ??
+                  summary['pre_auth_amount'] ??
+                  summary['preAuthAmount'])
+              : null),
+    ) ?? 0;
+    final effectiveDeposit = topLevelDeposit > 0 ? topLevelDeposit : activeKitPreAuth;
 
     return RemoteCart(
       id: json['id']?.toString() ?? '',
@@ -231,29 +307,22 @@ class RemoteCart {
       customerAddressId: _nonEmpty(
         json['customer_address_id'] ?? json['customerAddressId'],
       ),
-      subtotal: _parseNum(json['subtotal']) ?? 0,
-      deliveryCharge:
-          _parseNum(json['delivery_charge'] ?? json['deliveryCharge']) ?? 0,
-      discountAmount: _parseNum(
-            json['discount_amount'] ??
-                json['discountAmount'] ??
-                (summary is Map
-                    ? (summary['discount_amount'] ?? summary['discountAmount'])
-                    : null),
-          ) ??
-          0,
-      taxAmount: _parseNum(json['tax_amount'] ?? json['taxAmount']) ?? 0,
-      totalAmount:
-          _parseNum(json['total_amount'] ?? json['totalAmount']) ?? 0,
+      subtotal: canonicalSubtotal,
+      deliveryCharge: rawDelivery,
+      discountAmount: rawDiscount,
+      taxAmount: canonicalTax,
+      totalAmount: canonicalTotal,
       itemCount: qtySum,
       cartStatus: json['cart_status']?.toString() ??
           json['cartStatus']?.toString() ??
           'active',
       updatedAt: _nonEmpty(json['updated_at'] ?? json['updatedAt']),
-      subscriptionCount: sectionCount('subscription'),
-      nonSubscriptionCount: sectionCount('non_subscription'),
-      essentialsCount: sectionCount('essentials'),
-      kidsCount: sectionCount('kids'),
+      subscriptionCount: subCount,
+      nonSubscriptionCount: nonSubCount,
+      essentialsCount: essCount,
+      kidsCount: kdCount,
+      activeKitPrice: activeKitPrice,
+      securityDepositAmount: effectiveDeposit,
     );
   }
 }
@@ -272,22 +341,75 @@ String _normalizeItemType(dynamic raw) {
   return '';
 }
 
+bool _sameVariant(String? a, String? b) {
+  final va = a?.trim() ?? '';
+  final vb = b?.trim() ?? '';
+  if (va.isEmpty && vb.isEmpty) return true;
+  return va == vb;
+}
+
+List<RemoteCartItem> _deduplicateItems(List<RemoteCartItem> items) {
+  final result = <RemoteCartItem>[];
+  for (final item in items) {
+    if (item.productId.isEmpty || item.quantity <= 0) continue;
+    final pid = item.productId.trim();
+    final vid = item.variantId?.trim() ?? '';
+    final type = item.itemType.trim();
+
+    final existingIndex = result.indexWhere((r) =>
+        r.productId.trim() == pid &&
+        (r.variantId?.trim() ?? '') == vid &&
+        (type.isEmpty || r.itemType.trim().isEmpty || r.itemType.trim() == type));
+
+    if (existingIndex >= 0) {
+      final existing = result[existingIndex];
+      final finalQty = item.quantity > 0 ? item.quantity : existing.quantity;
+      final unit = existing.unitPrice > 0 ? existing.unitPrice : item.unitPrice;
+      result[existingIndex] = RemoteCartItem(
+        productId: existing.productId,
+        productName: existing.productName.isNotEmpty
+            ? existing.productName
+            : item.productName,
+        variantId: existing.variantId ?? item.variantId,
+        imageUrl: (existing.imageUrl != null && existing.imageUrl!.isNotEmpty)
+            ? existing.imageUrl
+            : item.imageUrl,
+        categoryName: existing.categoryName ?? item.categoryName,
+        productClass: existing.productClass ?? item.productClass,
+        itemType: existing.itemType.isNotEmpty
+            ? existing.itemType
+            : item.itemType,
+        quantity: finalQty,
+        unitPrice: unit,
+        lineTotal: unit > 0 ? unit * finalQty : item.lineTotal,
+        size: existing.size ?? item.size,
+        kitDetails: existing.kitDetails ?? item.kitDetails,
+      );
+    } else {
+      result.add(item);
+    }
+  }
+  return result;
+}
+
 List<RemoteCartItem> _canonicalCartLines(
   List<RemoteCartItem> cartItems,
   List<RemoteCartItem> sectionItems,
 ) {
-  if (sectionItems.isEmpty) return cartItems;
+  if (sectionItems.isEmpty) return _deduplicateItems(cartItems);
   final extras = <RemoteCartItem>[];
   for (final item in cartItems) {
     final inSection = sectionItems.any(
       (section) =>
           section.productId.trim() == item.productId.trim() &&
-          (section.variantId ?? '') == (item.variantId ?? '') &&
-          section.itemType == item.itemType,
+          _sameVariant(section.variantId, item.variantId) &&
+          (section.itemType.isEmpty ||
+              item.itemType.isEmpty ||
+              section.itemType == item.itemType),
     );
     if (!inSection) extras.add(item);
   }
-  return [...sectionItems, ...extras];
+  return _deduplicateItems([...sectionItems, ...extras]);
 }
 
 void _flattenAndAdd(
@@ -315,6 +437,9 @@ void _flattenAndAdd(
           
           // INJECT the Master Kit's Product ID so CartBloc knows it!
           kitJson['wardrobe_kit_product_id'] = parsed.productId;
+          if (parsed.variantId != null && parsed.variantId!.isNotEmpty) {
+            kitJson['wardrobe_kit_variant_id'] = parsed.variantId;
+          }
           
           subMap['kitDetails'] = kitJson;
         }
@@ -333,16 +458,76 @@ void _flattenAndAdd(
   }
 }
 
-List<RemoteCartItem> _parseItemList(dynamic itemsRaw) {
-  final items = <RemoteCartItem>[];
-  if (itemsRaw is! List) return items;
-  for (final item in itemsRaw) {
-    if (item is Map) {
-      final parsed = RemoteCartItem.fromJson(Map<String, dynamic>.from(item));
-      _flattenAndAdd(parsed, items, parsed.itemType);
+List<RemoteCartItem> _extractCanonicalKitAndItems(dynamic itemsRaw, {String defaultType = ''}) {
+  if (itemsRaw is! List) return const [];
+
+  final kitEntries = <Map<String, dynamic>>[];
+  final directItems = <RemoteCartItem>[];
+
+  for (final raw in itemsRaw) {
+    if (raw is! Map) continue;
+    final map = Map<String, dynamic>.from(raw);
+    final kitRaw = map['kitDetails'] ?? map['kit_details'];
+    final selectedItems = kitRaw is Map ? (kitRaw['selectedItems'] ?? kitRaw['selected_items']) : null;
+
+    if (selectedItems is List && selectedItems.isNotEmpty) {
+      kitEntries.add(map);
+    } else {
+      final parsed = RemoteCartItem.fromJson(map, defaultType: defaultType);
+      if (parsed.productId.isNotEmpty && parsed.quantity > 0) {
+        directItems.add(parsed);
+      }
     }
   }
-  return items;
+
+  final result = <RemoteCartItem>[];
+
+  // If duplicate kit entries exist for the same section / kit ID,
+  // retain only the CANONICAL latest kit entry.
+  // Prefer the last entry (backend appends snapshots). When ties exist in
+  // cartItems vs sections, last-writer in each list wins per groupKey.
+  if (kitEntries.isNotEmpty) {
+    final Map<String, Map<String, dynamic>> latestKitPerGroup = {};
+    final Map<String, int> latestIndexPerGroup = {};
+    for (var i = 0; i < kitEntries.length; i++) {
+      final kitMap = kitEntries[i];
+      final kitRaw = (kitMap['kitDetails'] ?? kitMap['kit_details']) as Map;
+      final kitId = kitRaw['wardrobe_kit_id'] ??
+          kitRaw['wardrobeKitId'] ??
+          kitRaw['kitId'] ??
+          kitRaw['selectedKitId'] ??
+          kitRaw['selected_kit_id'] ??
+          kitRaw['kit_type'] ??
+          'default_kit';
+      final section = _normalizeItemType(
+        kitMap['cart_section'] ?? kitMap['item_type'] ?? defaultType,
+      );
+      // Group by section + kit product id so historical rows collapse to one.
+      final kitProductId = kitMap['productId'] ??
+          kitMap['product_id'] ??
+          kitRaw['wardrobe_kit_product_id'] ??
+          kitId;
+      final groupKey = '$section|$kitProductId';
+      final prevIdx = latestIndexPerGroup[groupKey];
+      if (prevIdx == null || i >= prevIdx) {
+        latestKitPerGroup[groupKey] = kitMap;
+        latestIndexPerGroup[groupKey] = i;
+      }
+    }
+
+    for (final canonicalKitMap in latestKitPerGroup.values) {
+      final parsedKit =
+          RemoteCartItem.fromJson(canonicalKitMap, defaultType: defaultType);
+      _flattenAndAdd(parsedKit, result, parsedKit.itemType);
+    }
+  }
+
+  result.addAll(directItems);
+  return result;
+}
+
+List<RemoteCartItem> _parseItemList(dynamic itemsRaw) {
+  return _extractCanonicalKitAndItems(itemsRaw);
 }
 
 List<RemoteCartItem> _itemsFromSections(dynamic sections) {
@@ -355,14 +540,7 @@ List<RemoteCartItem> _itemsFromSections(dynamic sections) {
     if (block is! Map) return;
     final list = block['items'];
     if (list is! List) return;
-    for (final row in list) {
-      if (row is! Map) continue;
-      final parsed = RemoteCartItem.fromJson(
-        Map<String, dynamic>.from(row),
-        defaultType: key,
-      );
-      _flattenAndAdd(parsed, items, key);
-    }
+    items.addAll(_extractCanonicalKitAndItems(list, defaultType: key));
   }
 
   addSection('subscription');

@@ -8,6 +8,9 @@ import 'package:nomowear/core/services/auth_storage.dart';
 import 'package:nomowear/core/utils/api_id_utils.dart';
 import 'package:nomowear/features/cart/data/models/remote_cart.dart';
 import 'package:nomowear/features/checkout/data/checkout_session.dart';
+import 'package:nomowear/features/checkout/data/subscription_kit_preferences.dart';
+import 'package:nomowear/features/products/data/product_cache.dart';
+import 'package:nomowear/features/products/data/product_repository.dart';
 import 'package:nomowear/features/profile/data/profile_cache.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
 
@@ -110,8 +113,23 @@ class CartRepository {
     if (kDebugMode) debugPrint('[CART_PERF] GET START requestId=$requestId source=$source');
     final sw = Stopwatch()..start();
 
+    var addressId = CheckoutSession.instance.addressId?.trim();
+    if (addressId == null || addressId.isEmpty) {
+      for (final addr in ProfileCache.instance.customer?.addresses ?? const []) {
+        final id = addr.id?.trim();
+        if (id != null && id.isNotEmpty) {
+          addressId = id;
+          break;
+        }
+      }
+    }
+
+    final path = (addressId != null && addressId.isNotEmpty && isApiUuid(addressId))
+        ? '${ApiConstants.cartPath}?addressId=$addressId'
+        : ApiConstants.cartPath;
+
     final json = await _apiClient.get(
-      ApiConstants.cartPath,
+      path,
       authToken: await _token(),
     );
     _printCartDebugGet(json: json, requestId: requestId, source: source);
@@ -156,21 +174,74 @@ class CartRepository {
       );
     }
 
-    final variantId = (request.variantId != null &&
+    var variantId = (request.variantId != null &&
             request.variantId!.trim().isNotEmpty &&
-            isApiUuid(request.variantId!))
+            request.variantId!.trim() != '-')
         ? request.variantId!.trim()
         : null;
 
-    final kitDetails = (request.kitDetails != null && request.kitDetails!.isNotEmpty)
+    // Only invent a variant for wardrobe-kit POSTs. For garments/essentials,
+    // a wrong first-variant fallback creates duplicate / incorrect cart lines.
+    final isKitWrite =
+        request.kitDetails != null || request.productClass == 'wardrobe_kit';
+    if ((variantId == null || variantId.isEmpty) && isKitWrite) {
+      final cachedProduct = ProductCache.instance.findById(request.productId);
+      if (cachedProduct != null && cachedProduct.variants.isNotEmpty) {
+        variantId = cachedProduct.variants.first.id;
+      }
+
+      if (variantId == null || variantId.isEmpty) {
+        if (request.productId ==
+            SubscriptionKitPreferences.instance.wardrobeKitProductId) {
+          variantId = SubscriptionKitPreferences.instance.wardrobeKitVariantId;
+        }
+      }
+
+      if ((variantId == null || variantId.isEmpty) &&
+          isApiUuid(request.productId)) {
+        try {
+          final fetched =
+              await ProductRepository().getProductById(request.productId);
+          if (fetched.variants.isNotEmpty) {
+            variantId = fetched.variants.first.id;
+          }
+        } catch (e) {
+          _log('Failed to fetch product for variant in upsert: $e');
+        }
+      }
+    }
+
+    var kitDetails = (request.kitDetails != null && request.kitDetails!.isNotEmpty)
         ? request.kitDetails
         : null;
+
+    if (kitDetails == null &&
+        (request.itemType == 'subscription' ||
+            request.itemType == 'non_subscription')) {
+      final kitId = SubscriptionKitPreferences.instance.wardrobeKitId;
+      final kitPid = SubscriptionKitPreferences.instance.wardrobeKitProductId ?? request.productId;
+      kitDetails = await subscriptionKitDetails(
+        wardrobeKitId: kitId,
+        wardrobeKitProductId: kitPid,
+        durationDays: SubscriptionKitPreferences.instance.wardrobeKitDays > 0
+            ? SubscriptionKitPreferences.instance.wardrobeKitDays
+            : 1,
+        kitName: SubscriptionKitPreferences.instance.wardrobeKitName.isNotEmpty
+            ? SubscriptionKitPreferences.instance.wardrobeKitName
+            : 'Wardrobe Kit',
+        selectedItems: const [],
+      );
+      if (kitDetails != null) {
+        kitDetails['non_subscription'] = request.itemType == 'non_subscription';
+        kitDetails['cart_section'] = request.itemType;
+      }
+    }
 
     final body = <String, dynamic>{
       'productId': request.productId,
       'quantity': request.quantity,
-      'variantId': variantId,
-      'kitDetails': kitDetails,
+      if (variantId != null && variantId.isNotEmpty) 'variantId': variantId,
+      if (kitDetails != null) 'kitDetails': kitDetails,
     };
 
     if (request.itemType.isNotEmpty) {
@@ -261,14 +332,20 @@ class CartRepository {
     List<dynamic>? selectedItems,
   }) async {
     final session = CheckoutSession.instance;
-    var customer = ProfileCache.instance.customer;
-    try {
-      customer ??= await _profileRepository.getProfile();
-    } catch (_) {
-      customer = ProfileCache.instance.customer;
+    var addressId = session.addressId?.toString().trim();
+    if (addressId == null || addressId.isEmpty) {
+      addressId = SubscriptionKitPreferences.instance.addressId;
     }
 
-    var addressId = session.addressId?.toString().trim();
+    var customer = ProfileCache.instance.customer;
+    if ((addressId == null || addressId.isEmpty) && customer == null) {
+      try {
+        customer = await _profileRepository.getProfile();
+      } catch (_) {
+        customer = ProfileCache.instance.customer;
+      }
+    }
+
     if (addressId == null || addressId.isEmpty) {
       for (final address in customer?.addresses ?? const []) {
         final id = address.id?.trim();
@@ -285,7 +362,7 @@ class CartRepository {
         rawType.toLowerCase() != 'custom' &&
         rawType.toLowerCase() != 'standard') {
       resolvedKitType = rawType;
-    } else if (durationDays != null && durationDays > 0) {
+    } else if (durationDays > 0) {
       resolvedKitType = '$durationDays-Day wardrobe Kit';
     } else {
       resolvedKitType = rawType.isNotEmpty ? rawType : 'Wardrobe Kit';

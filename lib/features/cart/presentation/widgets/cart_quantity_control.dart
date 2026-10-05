@@ -11,15 +11,18 @@ class CartQuantityControl extends StatelessWidget {
   final CartItem item;
   final CartState state;
   final int essentialsMaxQty;
+  final ProductVariant? variant;
 
   const CartQuantityControl({
     Key? key,
     required this.item,
     required this.state,
     this.essentialsMaxQty = 5,
+    this.variant,
   }) : super(key: key);
 
   ProductVariant? _resolveVariant() {
+    if (variant != null) return variant;
     if (item.variantId == null) return null;
     final product = ProductCache.instance.findById(item.productId);
     if (product == null) return null;
@@ -31,15 +34,21 @@ class CartQuantityControl extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final variant = _resolveVariant();
-    int maxQty = item.isEssential ? essentialsMaxQty : CartLimits.effectiveMaxWardrobeGarments(state);
-    if (variant != null && variant.stockOnHand >= 0) {
-      maxQty = variant.stockOnHand;
+    final resolvedVariant = _resolveVariant();
+    final maxLimit = item.isEssential
+        ? essentialsMaxQty
+        : CartLimits.effectiveMaxWardrobeGarments(state);
+    int maxQty = maxLimit;
+    if (resolvedVariant != null && resolvedVariant.stockOnHand > 0) {
+      maxQty = resolvedVariant.stockOnHand < maxLimit
+          ? resolvedVariant.stockOnHand
+          : maxLimit;
     }
     final upper = maxQty < 1 ? 1 : maxQty;
     final displayQty = item.quantity > upper ? upper : item.quantity;
 
-    final canDecrease = displayQty > 1;
+    final isPending = state.isLinePending(item.id);
+    final canDecrease = displayQty >= 1;
     final canIncrease = displayQty < upper;
 
     return Container(
@@ -57,18 +66,51 @@ class CartQuantityControl extends StatelessWidget {
             isActive: canDecrease,
             onTap: () {
               if (canDecrease) {
-                context.read<CartBloc>().add(UpdateCartItemQuantityEvent(item.id, displayQty - 1));
+                if (displayQty > 1) {
+                  context.read<CartBloc>().add(
+                        UpdateCartItemQuantityEvent(item.id, displayQty - 1),
+                      );
+                } else {
+                  context.read<CartBloc>().add(
+                        RemoveFromCartEvent(item.id),
+                      );
+                }
               }
             },
           ),
           Expanded(
-            child: Text(
-              '$displayQty',
-              textAlign: TextAlign.center,
-              style: CustomTextStyles.montserratSemiBold.copyWith(
-                color: Colors.white,
-                fontSize: 12,
-              ),
+            child: Center(
+              child: isPending
+                  ? Row(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          '$displayQty',
+                          style: CustomTextStyles.montserratSemiBold.copyWith(
+                            color: Colors.white,
+                            fontSize: 12,
+                          ),
+                        ),
+                        SizedBox(width: 4.w),
+                        SizedBox(
+                          width: 10,
+                          height: 10,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 1.5,
+                            color: AppColours.primary,
+                          ),
+                        ),
+                      ],
+                    )
+                  : Text(
+                      '$displayQty',
+                      textAlign: TextAlign.center,
+                      style: CustomTextStyles.montserratSemiBold.copyWith(
+                        color: Colors.white,
+                        fontSize: 12,
+                      ),
+                    ),
             ),
           ),
           _buildQtyButton(
@@ -81,7 +123,9 @@ class CartQuantityControl extends StatelessWidget {
                     return;
                   }
                 }
-                context.read<CartBloc>().add(UpdateCartItemQuantityEvent(item.id, displayQty + 1));
+                context.read<CartBloc>().add(
+                      UpdateCartItemQuantityEvent(item.id, displayQty + 1),
+                    );
               }
             },
           ),

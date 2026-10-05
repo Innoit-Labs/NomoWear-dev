@@ -13,12 +13,12 @@ import 'package:nomowear/features/home/presentation/bloc/home_bloc.dart';
 import 'package:nomowear/features/home/presentation/screens/subscription_tab_widget.dart';
 import 'package:nomowear/features/products/data/models/product.dart';
 import 'package:nomowear/features/products/data/product_catalog.dart';
-import 'package:nomowear/features/subscriptions/data/subscription_cache.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_garment_balance.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_repository.dart';
 import 'package:nomowear/features/profile/data/profile_cache.dart';
 
 enum _WardrobeBookingChoice {
+  subscription,
   takeSubscription,
   withoutSubscription,
   cancel,
@@ -78,7 +78,7 @@ class WardrobeBookingFlow {
 
     if (isKidsCard || ProductCatalog.isDirectPurchaseProduct(product)) {
       final isValid = await _validateAddressOrShowDialog(context);
-      if (!isValid) return;
+      if (!isValid || !context.mounted) return;
       await _startBuyFlow(context, wardrobeCategory: wardrobeCategory);
       return;
     }
@@ -125,22 +125,78 @@ class WardrobeBookingFlow {
 
     final session = WardrobeBookingSession.instance;
     final category = session.wardrobeCategory?.trim();
-    if (category == null || category.isEmpty) {
-      Navigator.pushNamedAndRemoveUntil(
-        context,
-        AppRoutes.homeScreen,
-        (route) => false,
-      );
-      return;
-    }
+    final effectiveCategory =
+        (category != null && category.isNotEmpty) ? category : 'Men';
 
     await session.markSubscriptionPurchased();
     if (!context.mounted) return;
 
     await _openWardrobeKitSetup(
       context,
-      wardrobeCategory: category,
+      wardrobeCategory: effectiveCategory,
       wardrobeCategoryId: session.wardrobeCategoryId,
+      useSubscriptionBooking: true,
+    );
+  }
+
+  /// Direct entry for active subscription booking — navigates straight to Wardrobe Kit Selection.
+  static Future<void> startMembershipBooking(
+    BuildContext context, {
+    String wardrobeCategory = 'Men',
+    String? wardrobeCategoryId,
+  }) async {
+    await _ensureSessionsRestored();
+    if (!context.mounted) return;
+
+    final session = WardrobeBookingSession.instance;
+    final cat = session.wardrobeCategory?.trim() ??
+        CheckoutSession.instance.wardrobeCategory?.trim();
+    final effectiveCategory =
+        (cat != null && cat.isNotEmpty) ? cat : wardrobeCategory;
+    final effectiveCategoryId = session.wardrobeCategoryId ??
+        wardrobeCategoryId ??
+        CheckoutSession.instance.activeNonSubscriptionCategoryId;
+
+    try {
+      await SubscriptionRepository().getActiveSubscription(forceRefresh: true);
+    } catch (_) {}
+    if (!context.mounted) return;
+
+    logBookingLimitCheck();
+    if (CartLimits.isSubscriptionBookingLimitExhausted()) {
+      logAddToCartLimitResult('BOOKING_LIMIT_REACHED');
+      if (!context.mounted) return;
+      await showUnlockFullAccessDialog(
+        context,
+        onContinueWithoutMembership: () async {
+          if (!context.mounted) return;
+          CheckoutSession.instance.clearWardrobeCategoryLock();
+          await WardrobeBookingSession.instance.beginPaidRentalContinuation();
+          if (!context.mounted) return;
+          await _openWardrobeKitSetup(
+            context,
+            wardrobeCategory: effectiveCategory,
+            wardrobeCategoryId: effectiveCategoryId,
+            useSubscriptionBooking: false,
+            preserveContinueWithoutMembership: true,
+          );
+        },
+      );
+      return;
+    }
+
+    await WardrobeBookingSession.instance.selectPath(
+      path: WardrobeBookingPath.subscription,
+      wardrobeCategory: effectiveCategory,
+      wardrobeCategoryId: effectiveCategoryId,
+      needsSubscriptionPurchase: false,
+    );
+    if (!context.mounted) return;
+
+    await _openWardrobeKitSetup(
+      context,
+      wardrobeCategory: effectiveCategory,
+      wardrobeCategoryId: effectiveCategoryId,
       useSubscriptionBooking: true,
     );
   }
@@ -293,120 +349,9 @@ class WardrobeBookingFlow {
     } catch (_) {}
     if (!context.mounted) return;
 
-    if (cartState.status == CartStatus.loaded && cartState.wardrobeItems.isEmpty) {
-      final isNonSubPath = session.isWithoutSubscriptionPath ||
-          CheckoutSession.instance.continueWithoutMembership;
-
-      if (!isNonSubPath) {
-        // Normal case: empty cart on subscription path — clear stale state.
-        if (kDebugMode) {
-          debugPrint('[CHOOSE] Cart empty (sub path) — clearing stale booking selection');
-        }
-        CheckoutSession.instance.clearBookingModeSelection();
-        await session.startNewBooking();
-      } else if (!session.kitSelected) {
-        // ─── CASE A ───────────────────────────────────────────────────────────
-        // User just tapped "Continue Without Membership" and came back to Home
-        // without selecting a kit yet.  Cart is empty but the non-sub mode is
-        // still intentional — keep it so _startChooseFlow skips the path dialog
-        // and goes straight to the Kit screen.
-        if (kDebugMode) {
-          debugPrint(
-            '[CHOOSE] Cart empty, continueWithoutMembership=true, kitSelected=false '
-            '— preserving non-sub mode for Kit screen',
-          );
-        }
-        // No-op: continueWithoutMembership + withoutSubscription path remain set.
-      } else {
-        // ─── CASE B ───────────────────────────────────────────────────────────
-        // User completed a full non-sub flow (selected kit + garments) and then
-        // cleared ALL cart items.  This is a deliberate full reset.
-        // Treat the next category selection as a brand-new flow and evaluate the
-        // user's current subscription / booking entitlement from scratch.
-        if (kDebugMode) {
-          final hasSub = SubscriptionCache.instance.activeSubscription != null;
-          debugPrint(
-            '[CART_CLEAR] cartItems=0\n'
-            '  hasActiveSubscription=$hasSub\n'
-            '  currentSelectionMode=reset_for_new_flow\n'
-            '  Reason: kitSelected=true + wardrobeItems.isEmpty → full session reset',
-          );
-        }
-        await WardrobeBookingSession.instance.startNewBooking();
-        CheckoutSession.instance.setDelivery(
-          continueWithoutMembership: false,
-          bookingMode: CheckoutBookingMode.unset,
-          useSubscriptionBooking: false,
-        );
-        CheckoutSession.instance.clearWardrobeCategoryLock();
-      }
-    }
-
-    logBookingLimitCheck();
-    final continuingPaidRental =
-        CheckoutSession.instance.continueWithoutMembership;
-    if (kDebugMode) {
-      debugPrint(
-        '[SUBSCRIPTION_FLOW] CHOOSE_ENTRY '
-        'continueWithoutMembership=$continuingPaidRental '
-        'useSubscriptionBooking=${CheckoutSession.instance.useSubscriptionBooking} '
-        'bookingMode=${CheckoutSession.instance.bookingMode.name} '
-        'sessionPath=${session.selectedPath.name} '
-        'backendSubscriptionStatus=${SubscriptionCache.instance.activeSubscription?.planStatus ?? "null"}',
-      );
-    }
-
-    if (!continuingPaidRental &&
-        CartLimits.isSubscriptionBookingLimitExhausted()) {
-      logAddToCartLimitResult('BOOKING_LIMIT_REACHED');
-      await showUnlockFullAccessDialog(
-        context,
-        onContinueWithoutMembership: () async {
-          if (!context.mounted) return;
-          CheckoutSession.instance.clearWardrobeCategoryLock();
-          await WardrobeBookingSession.instance.beginPaidRentalContinuation();
-          if (!context.mounted) return;
-          await _openWardrobeKitSetup(
-            context,
-            wardrobeCategory: wardrobeCategory,
-            wardrobeCategoryId: wardrobeCategoryId,
-            useSubscriptionBooking: false,
-            preserveContinueWithoutMembership: true,
-          );
-        },
-      );
-      return;
-    }
-
-    if (continuingPaidRental) {
-      if (kDebugMode) {
-        debugPrint('[CHOOSE] continueWithoutMembership → Wardrobe Kit');
-      }
-      await _openWardrobeKitSetup(
-        context,
-        wardrobeCategory: wardrobeCategory,
-        wardrobeCategoryId: wardrobeCategoryId,
-        useSubscriptionBooking: false,
-        preserveContinueWithoutMembership: true,
-      );
-      return;
-    }
-
-    if (session.shouldContinueToProducts) {
-      if (kDebugMode) {
-        debugPrint('[CHOOSE] → Products');
-      }
-      await _continueActiveBooking(
-        context,
-        wardrobeCategory: wardrobeCategory,
-        wardrobeCategoryId: wardrobeCategoryId,
-      );
-      return;
-    }
-
-    if (session.isClosed) {
+    if (cartState.wardrobeItems.isEmpty) {
+      CheckoutSession.instance.clearBookingModeSelection();
       await session.startNewBooking();
-      if (!context.mounted) return;
     }
 
     final hasActiveSubscription = await _hasActiveSubscription();
@@ -425,30 +370,87 @@ class WardrobeBookingFlow {
     final choice = await _showPathSelectionDialog(
       context,
       hasActiveSubscription: hasActiveSubscription,
+      wardrobeCategory: wardrobeCategory,
+      wardrobeCategoryId: wardrobeCategoryId,
     );
-    if (!context.mounted || choice == _WardrobeBookingChoice.cancel) return;
+    if (!context.mounted || choice == null || choice == _WardrobeBookingChoice.cancel) {
+      return;
+    }
+
+    final lockedCategory = CartLimits.lockedWardrobeCategory(cartState);
+    final bool isSameCategory = lockedCategory == null ||
+        CartLimits.categoriesMatch(lockedCategory, wardrobeCategory);
 
     switch (choice) {
-      case _WardrobeBookingChoice.takeSubscription:
-        if (hasActiveSubscription) {
+      case _WardrobeBookingChoice.subscription:
+        if (CartLimits.isSubscriptionBookingLimitExhausted()) {
+          logAddToCartLimitResult('BOOKING_LIMIT_REACHED');
+          if (!context.mounted) return;
+          await showUnlockFullAccessDialog(
+            context,
+            onContinueWithoutMembership: () async {
+              if (!context.mounted) return;
+              CheckoutSession.instance.clearWardrobeCategoryLock();
+              await WardrobeBookingSession.instance.beginPaidRentalContinuation();
+              if (!context.mounted) return;
+              await _openWardrobeKitSetup(
+                context,
+                wardrobeCategory: wardrobeCategory,
+                wardrobeCategoryId: wardrobeCategoryId,
+                useSubscriptionBooking: false,
+                preserveContinueWithoutMembership: true,
+              );
+            },
+          );
+          return;
+        }
+
+        final hasActiveSubGarments = isSameCategory &&
+            cartState.subscriptionGarmentItems.isNotEmpty &&
+            session.shouldContinueToProducts &&
+            session.isSubscriptionPath;
+
+        if (hasActiveSubGarments) {
+          await _continueActiveBooking(
+            context,
+            wardrobeCategory: wardrobeCategory,
+            wardrobeCategoryId: wardrobeCategoryId,
+          );
+        } else {
           await _onWithSubscription(
             context,
             wardrobeCategory,
             wardrobeCategoryId,
           );
+        }
+
+      case _WardrobeBookingChoice.takeSubscription:
+        await _onTakeSubscription(
+          context,
+          wardrobeCategory,
+          wardrobeCategoryId,
+        );
+
+      case _WardrobeBookingChoice.withoutSubscription:
+        final hasActivePaidGarments = isSameCategory &&
+            cartState.paidRentalGarmentItems.isNotEmpty &&
+            session.shouldContinueToProducts &&
+            session.isWithoutSubscriptionPath;
+
+        if (hasActivePaidGarments) {
+          await _continueActiveBooking(
+            context,
+            wardrobeCategory: wardrobeCategory,
+            wardrobeCategoryId: wardrobeCategoryId,
+          );
         } else {
-          await _onTakeSubscription(
+          await _onContinueWithoutSubscription(
             context,
             wardrobeCategory,
             wardrobeCategoryId,
           );
         }
-      case _WardrobeBookingChoice.withoutSubscription:
-        await _onContinueWithoutSubscription(
-          context,
-          wardrobeCategory,
-          wardrobeCategoryId,
-        );
+
       case _WardrobeBookingChoice.cancel:
         break;
     }
@@ -472,35 +474,9 @@ class WardrobeBookingFlow {
   static Future<void> _onWithSubscription(
     BuildContext context,
     String wardrobeCategory,
-    String? wardrobeCategoryId,
-  ) async {
-    try {
-      await SubscriptionRepository().getActiveSubscription(forceRefresh: true);
-    } catch (_) {}
-    if (!context.mounted) return;
-
-    logBookingLimitCheck();
-    if (CartLimits.isSubscriptionBookingLimitExhausted()) {
-      logLimitDialog('SUBSCRIPTION_BOOKING_LIMIT');
-      await showUnlockFullAccessDialog(
-        context,
-        onContinueWithoutMembership: () async {
-          if (!context.mounted) return;
-          CheckoutSession.instance.clearWardrobeCategoryLock();
-          await WardrobeBookingSession.instance.beginPaidRentalContinuation();
-          if (!context.mounted) return;
-          await _openWardrobeKitSetup(
-            context,
-            wardrobeCategory: wardrobeCategory,
-            wardrobeCategoryId: wardrobeCategoryId,
-            useSubscriptionBooking: false,
-            preserveContinueWithoutMembership: true,
-          );
-        },
-      );
-      return;
-    }
-
+    String? wardrobeCategoryId, {
+    bool replaceCurrentRoute = false,
+  }) async {
     await WardrobeBookingSession.instance.selectPath(
       path: WardrobeBookingPath.subscription,
       wardrobeCategory: wardrobeCategory,
@@ -514,14 +490,16 @@ class WardrobeBookingFlow {
       wardrobeCategory: wardrobeCategory,
       wardrobeCategoryId: wardrobeCategoryId,
       useSubscriptionBooking: true,
+      replaceCurrentRoute: replaceCurrentRoute,
     );
   }
 
   static Future<void> _onContinueWithoutSubscription(
     BuildContext context,
     String wardrobeCategory,
-    String? wardrobeCategoryId,
-  ) async {
+    String? wardrobeCategoryId, {
+    bool replaceCurrentRoute = false,
+  }) async {
     await WardrobeBookingSession.instance.selectPath(
       path: WardrobeBookingPath.withoutSubscription,
       wardrobeCategory: wardrobeCategory,
@@ -539,6 +517,7 @@ class WardrobeBookingFlow {
       wardrobeCategory: wardrobeCategory,
       wardrobeCategoryId: wardrobeCategoryId,
       useSubscriptionBooking: false,
+      replaceCurrentRoute: replaceCurrentRoute,
     );
   }
 
@@ -548,11 +527,20 @@ class WardrobeBookingFlow {
     String? wardrobeCategoryId,
   }) async {
     final session = WardrobeBookingSession.instance;
-    if (session.isWithoutSubscriptionPath) {
+    final isNonSub = session.isWithoutSubscriptionPath ||
+        CheckoutSession.instance.continueWithoutMembership;
+    if (isNonSub) {
       CheckoutSession.instance.lockNonSubWardrobeCategory(
         wardrobeCategory,
         categoryId: wardrobeCategoryId ??
             CheckoutSession.instance.activeNonSubscriptionCategoryId,
+      );
+      CheckoutSession.instance.setDelivery(
+        useSubscriptionBooking: false,
+        continueWithoutMembership:
+            CheckoutSession.instance.continueWithoutMembership,
+        bookingMode: CheckoutBookingMode.oneTimeWardrobe,
+        wardrobeCategory: wardrobeCategory,
       );
     } else {
       CheckoutSession.instance.setDelivery(
@@ -609,6 +597,7 @@ class WardrobeBookingFlow {
           SetWardrobeKitEvent(
             kitId: prefs.wardrobeKitId!,
             wardrobeKitProductId: prefs.wardrobeKitProductId,
+            wardrobeKitVariantId: prefs.wardrobeKitVariantId,
             kitDays: prefs.wardrobeKitDays,
             kitName: prefs.wardrobeKitName,
             maxGarments: prefs.wardrobeKitMaxGarments,
@@ -626,6 +615,7 @@ class WardrobeBookingFlow {
     required bool useSubscriptionBooking,
     String? wardrobeCategoryId,
     bool preserveContinueWithoutMembership = false,
+    bool replaceCurrentRoute = false,
   }) async {
     if (!context.mounted) return;
 
@@ -658,11 +648,19 @@ class WardrobeBookingFlow {
     );
     if (!context.mounted) return;
 
-    Navigator.pushNamed(
-      context,
-      AppRoutes.screenshotScreen,
-      arguments: wardrobeCategory,
-    );
+    if (replaceCurrentRoute) {
+      Navigator.pushReplacementNamed(
+        context,
+        AppRoutes.chooseYourWardrobeKitScreen,
+        arguments: wardrobeCategory,
+      );
+    } else {
+      Navigator.pushNamed(
+        context,
+        AppRoutes.chooseYourWardrobeKitScreen,
+        arguments: wardrobeCategory,
+      );
+    }
   }
 
   static Future<bool> _hasActiveSubscription() async {
@@ -763,9 +761,11 @@ class WardrobeBookingFlow {
     return CheckoutBookingMode.unset;
   }
 
-  static Future<_WardrobeBookingChoice> _showPathSelectionDialog(
+  static Future<_WardrobeBookingChoice?> _showPathSelectionDialog(
     BuildContext context, {
     required bool hasActiveSubscription,
+    required String wardrobeCategory,
+    String? wardrobeCategoryId,
   }) async {
     final firstLabel =
         hasActiveSubscription ? 'Membership Booking' : 'Choose Subscription';
@@ -791,17 +791,23 @@ class WardrobeBookingFlow {
             actions: [
               _BookingDialogAction(
                 label: firstLabel,
-                onPressed: () => Navigator.pop(
-                  dialogContext,
-                  _WardrobeBookingChoice.takeSubscription,
-                ),
+                onPressed: () {
+                  Navigator.pop(
+                    dialogContext,
+                    hasActiveSubscription
+                        ? _WardrobeBookingChoice.subscription
+                        : _WardrobeBookingChoice.takeSubscription,
+                  );
+                },
               ),
               _BookingDialogAction(
                 label: 'Continue Without Subscription',
-                onPressed: () => Navigator.pop(
-                  dialogContext,
-                  _WardrobeBookingChoice.withoutSubscription,
-                ),
+                onPressed: () {
+                  Navigator.pop(
+                    dialogContext,
+                    _WardrobeBookingChoice.withoutSubscription,
+                  );
+                },
               ),
               _BookingDialogAction(
                 label: 'Cancel',
@@ -816,7 +822,7 @@ class WardrobeBookingFlow {
         );
       },
     );
-    return result ?? _WardrobeBookingChoice.cancel;
+    return result;
   }
 }
 

@@ -107,7 +107,7 @@ class OrderSuccessScreen extends StatelessWidget {
                   SizedBox(height: 40.h),
                   Container(
                     width: double.maxFinite,
-                    height: 54.h,
+                    height: 44.h,
                     decoration: BoxDecoration(
                       gradient: LinearGradient(
                         colors: [
@@ -147,7 +147,7 @@ class OrderSuccessScreen extends StatelessWidget {
                   if (continueToWardrobeKit) ...[
                     Container(
                       width: double.maxFinite,
-                      height: 54.h,
+                      height: 44.h,
                       decoration: BoxDecoration(
                         gradient: LinearGradient(
                           colors: [

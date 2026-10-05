@@ -225,6 +225,29 @@ class OrderRepository {
     return result;
   }
 
+  /// Cancels a pending order and releases reserved stock.
+  /// DELETE mobile/v1/orders/:id/cancel-pending
+  Future<Map<String, dynamic>> cancelPendingOrder(String orderId) async {
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+    final trimmedId = orderId.trim();
+    if (trimmedId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+    final json = await _apiClient.delete(
+      ApiConstants.cancelPendingOrderPath(trimmedId),
+      authToken: authToken,
+    );
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to cancel order',
+      );
+    }
+    return json;
+  }
+
   /// Requests a pickup/return for a delivered order.
   Future<OrderReturnResult> requestReturn({
     required String orderId,
