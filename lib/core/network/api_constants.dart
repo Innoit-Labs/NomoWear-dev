@@ -37,6 +37,25 @@ class ApiConstants {
   static String orderReturnPath(String orderId) =>
       '$ordersPath/${orderId.trim()}/return';
 
+  /// GET mobile/v1/orders/{orderId}/reattempt-quote
+  static String orderReattemptQuotePath(String orderId) =>
+      '$ordersPath/${orderId.trim()}/reattempt-quote';
+
+  /// POST mobile/v1/orders/{orderId}/reorder
+  static String orderReorderPath(String orderId) =>
+      '$ordersPath/${orderId.trim()}/reorder';
+
+  /// POST mobile/v1/orders/{orderId}/reattempt-return
+  static String orderReattemptReturnPath(String orderId) =>
+      '$ordersPath/${orderId.trim()}/reattempt-return';
+
+  /// POST waitlist
+  static const String waitlistPath = 'waitlist';
+
+  /// GET waitlist/status/{idOrNumber}
+  static String waitlistStatusPath(String idOrNumber) =>
+      'waitlist/status/${idOrNumber.trim()}';
+
   /// DELETE mobile/v1/orders/{orderId}/cancel-pending
   static String cancelPendingOrderPath(String orderId) =>
       '$ordersPath/${orderId.trim()}/cancel-pending';

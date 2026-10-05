@@ -77,6 +77,10 @@ class OrderHistoryItem {
     this.rejectionReason,
     this.isReturnWaitlisted = false,
     this.refundStatus,
+    this.returnResolutionStatus,
+    this.customerId,
+    this.waitlistNumber,
+    this.returnReattemptCount = 0,
   });
 
   final String id;
@@ -122,6 +126,17 @@ class OrderHistoryItem {
   final String? rejectionReason;
   final bool isReturnWaitlisted;
   final String? refundStatus;
+  final String? returnResolutionStatus;
+  final String? customerId;
+  final String? waitlistNumber;
+  final int returnReattemptCount;
+
+  bool get isDeliveryReattemptEligible {
+    final status = (orderStatus ?? '').trim().toUpperCase();
+    return status == 'NOT_DELIVERED' ||
+        status == 'DELIVERY_FAILED' ||
+        status == 'RETURNED_TO_IAP';
+  }
 
   static const _returnFlowStatuses = {
     'RETURN_REQUESTED',
@@ -391,6 +406,19 @@ class OrderHistoryItem {
       ),
       refundStatus: json['refund_status']?.toString() ??
           json['refundStatus']?.toString(),
+      returnResolutionStatus:
+          json['return_resolution_status']?.toString() ??
+          json['returnResolutionStatus']?.toString(),
+      customerId: json['customer_id']?.toString() ??
+          json['customerId']?.toString(),
+      waitlistNumber: json['waitlist_number']?.toString() ??
+          json['waitlistNumber']?.toString(),
+      returnReattemptCount: int.tryParse(
+            json['return_reattempt_count']?.toString() ??
+            json['returnReattemptCount']?.toString() ??
+            json['reattempt_count']?.toString() ??
+            '',
+          ) ?? 0,
     );
   }
 

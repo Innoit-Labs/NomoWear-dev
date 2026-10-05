@@ -6,7 +6,11 @@ import 'package:nomowear/features/checkout/data/checkout_session.dart';
 import 'package:nomowear/features/orders/data/models/initiate_order_result.dart';
 import 'package:nomowear/features/orders/data/models/order_history.dart';
 import 'package:nomowear/features/orders/data/models/order_return_result.dart';
+import 'package:nomowear/features/orders/data/models/reattempt_quote.dart';
+import 'package:nomowear/features/orders/data/models/refund_status_result.dart';
+import 'package:nomowear/features/orders/data/models/reorder_result.dart';
 import 'package:nomowear/features/orders/data/orders_cache.dart';
+import 'package:nomowear/features/orders/data/pending_refund_store.dart';
 import 'package:nomowear/features/profile/data/profile_cache.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
 import 'package:nomowear/features/subscriptions/data/subscription_cache.dart';
@@ -303,6 +307,241 @@ class OrderRepository {
           'Return request submitted successfully.',
       waitlisted: json['waitlisted'] == true,
     );
+  }
+
+  /// Gets delivery reattempt quote for failed/returned orders.
+  /// GET mobile/v1/orders/:id/reattempt-quote
+  Future<ReattemptQuote> getReattemptQuote(String orderId) async {
+    final trimmedId = orderId.trim();
+    if (trimmedId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final json = await _apiClient.get(
+      ApiConstants.orderReattemptQuotePath(trimmedId),
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to get reattempt quote',
+      );
+    }
+
+    final data = json['data'];
+    if (data is! Map<String, dynamic>) {
+      throw const ApiException('Invalid reattempt quote response');
+    }
+
+    return ReattemptQuote.fromJson(data);
+  }
+
+  /// Schedules delivery reattempt / reorder.
+  /// POST mobile/v1/orders/:id/reorder
+  Future<ReorderResult> reorderDelivery({
+    required String orderId,
+    required String deliveryDate,
+    required String deliveryTime,
+    String? razorpayPaymentId,
+    String? razorpayOrderId,
+    String? razorpaySignature,
+  }) async {
+    final trimmedId = orderId.trim();
+    if (trimmedId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final body = <String, dynamic>{
+      'delivery_date': deliveryDate.trim(),
+      'delivery_time': deliveryTime.trim(),
+    };
+    if (razorpayPaymentId != null && razorpayPaymentId.trim().isNotEmpty) {
+      body['razorpay_payment_id'] = razorpayPaymentId.trim();
+    }
+    if (razorpayOrderId != null && razorpayOrderId.trim().isNotEmpty) {
+      body['razorpay_order_id'] = razorpayOrderId.trim();
+    }
+    if (razorpaySignature != null && razorpaySignature.trim().isNotEmpty) {
+      body['razorpay_signature'] = razorpaySignature.trim();
+    }
+
+    final json = await _apiClient.post(
+      ApiConstants.orderReorderPath(trimmedId),
+      body,
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to schedule delivery reattempt',
+      );
+    }
+
+    return ReorderResult.fromJson(json);
+  }
+
+  /// Reschedules return pickup when previous pickup failed or rejected.
+  /// POST mobile/v1/orders/:id/reattempt-return
+  Future<OrderReturnResult> reattemptReturn({
+    required String orderId,
+    required String pickupDate,
+    required String pickupTime,
+    String? addressId,
+    String? note,
+    String? fullName,
+    String? mobile,
+  }) async {
+    final trimmedId = orderId.trim();
+    if (trimmedId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final body = <String, dynamic>{
+      'pickup_date': pickupDate.trim(),
+      'pickup_time': pickupTime.trim(),
+    };
+    if (addressId != null && addressId.trim().isNotEmpty) {
+      body['addressId'] = addressId.trim();
+    }
+    if (note != null && note.trim().isNotEmpty) {
+      body['note'] = note.trim();
+    }
+    if (fullName != null && fullName.trim().isNotEmpty) {
+      body['fullName'] = fullName.trim();
+    }
+    if (mobile != null && mobile.trim().isNotEmpty) {
+      body['mobile'] = mobile.trim();
+    }
+
+    final json = await _apiClient.post(
+      ApiConstants.orderReattemptReturnPath(trimmedId),
+      body,
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to reschedule return pickup',
+      );
+    }
+
+    return OrderReturnResult(
+      message: json['message']?.toString() ??
+          'Return pickup rescheduled successfully.',
+      waitlisted: json['waitlisted'] == true,
+    );
+  }
+
+  /// Submits customer refund / cancellation request.
+  /// POST waitlist
+  Future<String> submitRefundRequest({
+    required String orderId,
+    required String orderNumber,
+    required String customerId,
+    required String reason,
+    required num amount,
+    required String fullName,
+    required String mobile,
+    String? email,
+  }) async {
+    final trimmedOrderId = orderId.trim();
+    if (trimmedOrderId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final body = <String, dynamic>{
+      'waitlist_type': 'CUSTOMER_REFUND_REQUEST',
+      'form_data': {
+        'orderId': trimmedOrderId,
+        'orderNumber': orderNumber.trim(),
+        'customerId': customerId.trim(),
+        'reason': reason.trim(),
+        'amount': amount,
+        'fullName': fullName.trim(),
+        'mobile': mobile.trim(),
+        'email': (email ?? '').trim(),
+      },
+    };
+
+    final json = await _apiClient.post(
+      ApiConstants.waitlistPath,
+      body,
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to submit refund request',
+      );
+    }
+
+    final data = json['data'] is Map ? json['data'] : null;
+    final waitlistNum = (data?['waitlist_number'] ??
+            data?['waitlistNumber'] ??
+            json['waitlist_number'] ??
+            data?['number'] ??
+            data?['id'] ??
+            json['id'] ??
+            '')
+        .toString();
+
+    if (waitlistNum.isNotEmpty) {
+      await PendingRefundStore.instance.saveRefundRequest(
+        orderId: trimmedOrderId,
+        waitlistNumber: waitlistNum,
+      );
+    }
+
+    return waitlistNum.isNotEmpty
+        ? waitlistNum
+        : (json['message']?.toString() ?? 'Refund request submitted');
+  }
+
+  /// Gets status of a waitlist item (e.g. CUSTOMER_REFUND_REQUEST).
+  /// GET waitlist/status/:idOrNumber
+  Future<RefundStatusResult> getRefundStatus(String idOrNumber) async {
+    final trimmed = idOrNumber.trim();
+    if (trimmed.isEmpty) {
+      throw const ApiException('Invalid waitlist number or id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final json = await _apiClient.get(
+      ApiConstants.waitlistStatusPath(trimmed),
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to get refund status',
+      );
+    }
+
+    return RefundStatusResult.fromJson(json, trimmed);
   }
 
   Future<bool> hasActiveSubscription({bool forceRefresh = false}) async {

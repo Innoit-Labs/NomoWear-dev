@@ -5,6 +5,7 @@ import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/features/orders/data/order_repository.dart';
 import 'package:nomowear/features/orders/data/pending_return_store.dart';
+import 'package:nomowear/features/orders/data/models/order_return_result.dart';
 import 'package:nomowear/features/profile/domain/saved_address.dart';
 import 'package:nomowear/features/profile/domain/user_order.dart';
 
@@ -13,10 +14,14 @@ class ReturnOrderScreen extends StatefulWidget {
     super.key,
     required this.orderId,
     this.orderNumber,
+    this.isReattempt = false,
+    this.failureReason,
   });
 
   final String orderId;
   final String? orderNumber;
+  final bool isReattempt;
+  final String? failureReason;
 
   @override
   State<ReturnOrderScreen> createState() => _ReturnOrderScreenState();
@@ -173,13 +178,24 @@ class _ReturnOrderScreenState extends State<ReturnOrderScreen> {
     setState(() => _submitting = true);
 
     try {
-      final result = await _orderRepository.requestReturn(
-        orderId: widget.orderId,
-        addressId: addressId,
-        pickupDate: _apiPickupDate,
-        pickupTime: _pickupTime!,
-        note: _noteController.text,
-      );
+      final OrderReturnResult result;
+      if (widget.isReattempt) {
+        result = await _orderRepository.reattemptReturn(
+          orderId: widget.orderId,
+          addressId: addressId,
+          pickupDate: _apiPickupDate,
+          pickupTime: _pickupTime!,
+          note: _noteController.text,
+        );
+      } else {
+        result = await _orderRepository.requestReturn(
+          orderId: widget.orderId,
+          addressId: addressId,
+          pickupDate: _apiPickupDate,
+          pickupTime: _pickupTime!,
+          note: _noteController.text,
+        );
+      }
 
       await PendingReturnStore.instance.mark(widget.orderId);
       markUserOrderReturnSubmitted(widget.orderId);
@@ -192,7 +208,9 @@ class _ReturnOrderScreenState extends State<ReturnOrderScreen> {
         builder: (ctx) => AlertDialog(
           backgroundColor: const Color(0xFF16181D),
           title: Text(
-            result.waitlisted ? 'Return Waitlisted' : 'Return Requested',
+            widget.isReattempt
+                ? 'Return Pickup Rescheduled'
+                : (result.waitlisted ? 'Return Waitlisted' : 'Return Requested'),
             style: TextStyle(
               color: AppColours.primary,
               fontSize: 16.fSize,
@@ -286,7 +304,7 @@ class _ReturnOrderScreenState extends State<ReturnOrderScreen> {
           onPressed: _submitting ? null : () => Navigator.pop(context),
         ),
         title: Text(
-          'Return Order',
+          widget.isReattempt ? 'Reschedule Return Pickup' : 'Return Order',
           style: TextStyle(
             color: AppColours.primary,
             fontSize: 18.fSize,
@@ -327,6 +345,55 @@ class _ReturnOrderScreenState extends State<ReturnOrderScreen> {
                         letterSpacing: 1.1,
                       ),
                     ),
+                    if (widget.failureReason != null &&
+                        widget.failureReason!.trim().isNotEmpty) ...[
+                      SizedBox(height: 14.h),
+                      Container(
+                        padding: EdgeInsets.all(12.w),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2B1215),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFFEF4444).withValues(alpha: 0.5),
+                          ),
+                        ),
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Icon(
+                              Icons.error_outline_rounded,
+                              color: Color(0xFFEF4444),
+                              size: 20,
+                            ),
+                            SizedBox(width: 10.w),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    'Previous Pickup Failed',
+                                    style: TextStyle(
+                                      color: const Color(0xFFEF4444),
+                                      fontSize: 12.5.fSize,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  SizedBox(height: 3.h),
+                                  Text(
+                                    widget.failureReason!,
+                                    style: TextStyle(
+                                      color: Colors.white70,
+                                      fontSize: 11.5.fSize,
+                                      height: 1.3,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                     SizedBox(height: 24.h),
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -445,7 +512,9 @@ class _ReturnOrderScreenState extends State<ReturnOrderScreen> {
                           ),
                         )
                       : Text(
-                          'SUBMIT RETURN REQUEST',
+                          widget.isReattempt
+                              ? 'RESCHEDULE RETURN PICKUP'
+                              : 'SUBMIT RETURN REQUEST',
                           style: CustomTextStyles.montserratBold.copyWith(
                             fontSize: 14,
                             color: Colors.black,
