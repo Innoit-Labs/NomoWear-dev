@@ -133,16 +133,66 @@ class UserOrder {
     this.actionEnabled = true,
     this.actionFlow = OrderActionFlow.forward,
     this.returnStatus,
+    this.refundStatus,
     this.daysLeft,
     this.customerAddressId,
     this.hasReturnFailed = false,
     this.canReattemptReturn = false,
     this.rejectionReason,
+    this.returnResolutionStatus,
+    this.customerId,
+    this.waitlistNumber,
+    this.returnReattemptCount = 0,
   });
 
+  final String? refundStatus;
   final bool hasReturnFailed;
   final bool canReattemptReturn;
   final String? rejectionReason;
+  final String? returnResolutionStatus;
+  final String? customerId;
+  final String? waitlistNumber;
+  final int returnReattemptCount;
+
+  bool get isDeliveryReattemptEligible {
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    return status == 'NOT_DELIVERED' ||
+        status == 'DELIVERY_FAILED' ||
+        status == 'RETURNED_TO_IAP';
+  }
+
+  bool get isReturnFailed {
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    return status == 'RETURN_FAILED' ||
+        status == 'RETURN_REJECTED' ||
+        hasReturnFailed;
+  }
+
+  bool get isReturnEscalated {
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    return returnReattemptCount >= 2 || status == 'ESCALATION_ACTIVE';
+  }
+
+  bool get isRefundEligible {
+    final isNonSub = orderType?.trim().toUpperCase() == 'NON_SUBSCRIPTION';
+    if (!isNonSub) return false;
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    const disallowed = [
+      'READY_FOR_DELIVERY',
+      'DISPATCHED',
+      'SHIPPED',
+      'DELIVERED',
+      'COMPLETED',
+      'CANCELLED',
+      'REFUNDED',
+    ];
+    if (disallowed.contains(status)) return false;
+    if (refundStatus?.trim().toUpperCase() == 'REFUNDED') return false;
+    return true;
+  }
+
+  bool get isReturnReattemptPending =>
+      returnResolutionStatus?.trim().toUpperCase() == 'RETURN_REATTEMPT_PENDING';
 
   bool get hasLineItems => lineItems != null && lineItems!.isNotEmpty;
 
@@ -182,8 +232,13 @@ class UserOrder {
     bool? actionEnabled,
     OrderActionFlow? actionFlow,
     String? returnStatus,
+    String? refundStatus,
     int? daysLeft,
     String? customerAddressId,
+    String? returnResolutionStatus,
+    String? customerId,
+    String? waitlistNumber,
+    int? returnReattemptCount,
   }) {
     return UserOrder(
       id: id ?? this.id,
@@ -210,10 +265,16 @@ class UserOrder {
       hasReturnFailed: hasReturnFailed ?? this.hasReturnFailed,
       canReattemptReturn: canReattemptReturn ?? this.canReattemptReturn,
       rejectionReason: rejectionReason ?? this.rejectionReason,
+      returnResolutionStatus:
+          returnResolutionStatus ?? this.returnResolutionStatus,
+      customerId: customerId ?? this.customerId,
+      waitlistNumber: waitlistNumber ?? this.waitlistNumber,
+      returnReattemptCount: returnReattemptCount ?? this.returnReattemptCount,
       actionLabel: actionLabel ?? this.actionLabel,
       actionEnabled: actionEnabled ?? this.actionEnabled,
       actionFlow: actionFlow ?? this.actionFlow,
       returnStatus: returnStatus ?? this.returnStatus,
+      refundStatus: refundStatus ?? this.refundStatus,
       daysLeft: daysLeft ?? this.daysLeft,
       customerAddressId: customerAddressId ?? this.customerAddressId,
       pickupDate: pickupDate,

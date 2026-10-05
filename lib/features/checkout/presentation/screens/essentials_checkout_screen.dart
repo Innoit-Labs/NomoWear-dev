@@ -17,6 +17,7 @@ import 'package:nomowear/features/checkout/presentation/utils/checkout_pricing.d
 import 'package:nomowear/features/checkout/presentation/utils/subscription_booking_eligibility.dart';
 import 'package:nomowear/features/orders/data/models/initiate_order_result.dart';
 import 'package:nomowear/features/orders/data/order_repository.dart';
+import 'package:nomowear/features/orders/presentation/widgets/no_return_blocked_dialog.dart';
 import 'package:nomowear/features/orders/data/orders_cache.dart';
 import 'package:nomowear/features/profile/data/profile_cache.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
@@ -670,7 +671,15 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);
-      CustomAppSnackBar.showError(context, e.message);
+      if (e.isNoReturnBlocked) {
+        await showNoReturnBlockedDialog(
+          context,
+          overdueOrderNumber: e.overdueOrderNumber,
+          message: e.message,
+        );
+      } else {
+        CustomAppSnackBar.showError(context, e.message);
+      }
     } catch (_) {
       if (!mounted) return;
       setState(() => _isPlacingOrder = false);

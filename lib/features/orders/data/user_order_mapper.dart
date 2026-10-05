@@ -123,6 +123,7 @@ class UserOrderMapper {
       daysLeft: order.daysLeft,
       pendingReturn: pendingReturn,
       returnFailed: returnFailed,
+      returnResolutionStatus: order.returnResolutionStatus,
     );
 
     return UserOrder(
@@ -179,6 +180,10 @@ class UserOrderMapper {
       returnStatus: order.returnStatus,
       daysLeft: order.daysLeft,
       customerAddressId: order.resolvedCustomerAddressId,
+      returnResolutionStatus: order.returnResolutionStatus,
+      customerId: order.customerId ?? customer?.id,
+      waitlistNumber: order.waitlistNumber,
+      returnReattemptCount: order.returnReattemptCount,
     );
   }
 
@@ -352,11 +357,10 @@ class UserOrderMapper {
             ? matched!.city!.trim()
             : 'Home');
 
+    final custMobile = customer?.mobile.trim();
     var mobile = (jsonMobile != null && jsonMobile.trim().isNotEmpty)
         ? jsonMobile.trim()
-        : (customer?.mobile?.trim().isNotEmpty == true
-            ? customer!.mobile!.trim()
-            : '');
+        : (custMobile != null && custMobile.isNotEmpty ? custMobile : '');
 
     return (
       label: label,

@@ -279,7 +279,16 @@ class ApiClient {
 
     final message =
         decoded['message']?.toString() ?? 'Request failed (${response.statusCode})';
-    throw ApiException(message, statusCode: response.statusCode);
+    final code = decoded['code']?.toString();
+    final overdueOrderNumber = decoded['overdueOrderNumber']?.toString() ??
+        decoded['overdue_order_number']?.toString();
+    throw ApiException(
+      message,
+      statusCode: response.statusCode,
+      code: code,
+      overdueOrderNumber: overdueOrderNumber,
+      rawResponse: decoded,
+    );
   }
 
   void _logRequest({

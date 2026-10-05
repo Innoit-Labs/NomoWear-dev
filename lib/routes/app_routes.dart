@@ -240,6 +240,8 @@ class AppRoutes {
         return ReturnOrderScreen(
           orderId: args['orderId']?.toString() ?? '',
           orderNumber: args['orderNumber']?.toString(),
+          isReattempt: args['isReattempt'] == true,
+          failureReason: args['failureReason']?.toString(),
         );
       }
       return ReturnOrderScreen(orderId: args?.toString() ?? '');

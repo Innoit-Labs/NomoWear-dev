@@ -11,6 +11,7 @@ import 'package:nomowear/features/checkout/presentation/utils/checkout_pricing.d
 import 'package:nomowear/features/profile/presentation/utils/profile_order_guard.dart';
 import 'package:nomowear/features/home/presentation/bloc/home_bloc.dart';
 import 'package:nomowear/features/orders/data/order_repository.dart';
+import 'package:nomowear/features/orders/presentation/widgets/no_return_blocked_dialog.dart';
 import 'package:nomowear/features/profile/data/profile_cache.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
 import 'package:nomowear/features/products/data/models/product_variant.dart';
@@ -1708,7 +1709,15 @@ class _CartScreenState extends State<CartScreen> {
       );
     } on ApiException catch (e) {
       if (!context.mounted) return;
-      CustomAppSnackBar.showError(context, e.message);
+      if (e.isNoReturnBlocked) {
+        await showNoReturnBlockedDialog(
+          context,
+          overdueOrderNumber: e.overdueOrderNumber,
+          message: e.message,
+        );
+      } else {
+        CustomAppSnackBar.showError(context, e.message);
+      }
     } catch (_) {
       if (!context.mounted) return;
       CustomAppSnackBar.showError(

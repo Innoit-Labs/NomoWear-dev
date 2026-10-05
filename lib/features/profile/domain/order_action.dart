@@ -41,6 +41,24 @@ class OrderActionDecision {
     enabled: false,
     flow: OrderActionFlow.cancelled,
   );
+
+  static const reattemptPickup = OrderActionDecision(
+    label: 'Reattempt Pickup',
+    enabled: true,
+    flow: OrderActionFlow.reverse,
+  );
+
+  static const reschedulePending = OrderActionDecision(
+    label: 'Pickup Reschedule In Progress',
+    enabled: false,
+    flow: OrderActionFlow.reverse,
+  );
+
+  static const reattemptDelivery = OrderActionDecision(
+    label: 'Schedule Delivery Reattempt',
+    enabled: true,
+    flow: OrderActionFlow.forward,
+  );
 }
 
 /// Picks the order action from the current status, not from older history rows.
@@ -65,7 +83,6 @@ class OrderActionResolver {
     'OUT_FOR_DELIVERY',
     'READY_FOR_DELIVERY',
     'REORDER_REQUESTED',
-    'NOT_DELIVERED',
   };
 
   static const _returnSettled = {
@@ -83,19 +100,32 @@ class OrderActionResolver {
     int? daysLeft,
     bool pendingReturn = false,
     bool returnFailed = false,
+    String? returnResolutionStatus,
   }) {
     final status = orderStatus?.trim().toUpperCase() ?? '';
     final ret = returnStatus?.trim().toUpperCase() ?? '';
     final refund = refundStatus?.trim().toUpperCase() ?? '';
+    final resStatus = returnResolutionStatus?.trim().toUpperCase() ?? '';
 
     if (status == 'CANCELLED') return OrderActionDecision.cancelled;
 
+    final isDeliveryReattempt = status == 'NOT_DELIVERED' ||
+        status == 'DELIVERY_FAILED' ||
+        status == 'RETURNED_TO_IAP';
+    if (isDeliveryReattempt) return OrderActionDecision.reattemptDelivery;
+
+    if (resStatus == 'RETURN_REATTEMPT_PENDING') {
+      return OrderActionDecision.reschedulePending;
+    }
+
     final failedNow = returnFailed ||
         status == 'RETURN_FAILED' ||
-        ret == 'RETURN_FAILED';
+        ret == 'RETURN_FAILED' ||
+        status == 'RETURN_REJECTED' ||
+        ret == 'RETURN_REJECTED';
     final settled =
         _returnSettled.contains(status) || _returnSettled.contains(ret);
-    if (failedNow && !settled) return OrderActionDecision.returnOrder;
+    if (failedNow && !settled) return OrderActionDecision.reattemptPickup;
 
     final reverseActive = pendingReturn ||
         isReturnWaitlisted ||

@@ -1,7 +1,12 @@
 import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/network/api_exception.dart';
+import 'package:nomowear/core/services/razorpay_service.dart';
 import 'package:nomowear/core/utils/api_id_utils.dart';
+import 'package:nomowear/features/auth/data/models/customer.dart';
+import 'package:nomowear/features/orders/data/models/reattempt_quote.dart';
+import 'package:nomowear/features/orders/data/models/refund_status_result.dart';
 import 'package:nomowear/features/orders/data/order_repository.dart';
+import 'package:nomowear/features/orders/data/pending_refund_store.dart';
 import 'package:nomowear/features/orders/data/pending_return_store.dart';
 import 'package:nomowear/features/orders/data/user_order_mapper.dart';
 import 'package:nomowear/features/products/data/product_cache.dart';
@@ -10,8 +15,11 @@ import 'package:nomowear/features/products/data/product_repository.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
 import 'package:nomowear/features/profile/domain/order_action.dart';
 import 'package:nomowear/features/profile/domain/user_order.dart';
+import 'package:nomowear/features/orders/presentation/widgets/no_return_blocked_dialog.dart';
+import 'package:nomowear/features/profile/domain/saved_address.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/product_details_screen.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
+import 'package:razorpay_flutter/razorpay_flutter.dart';
 
 class OrderDetailsScreen extends StatefulWidget {
   final String orderId;
@@ -26,6 +34,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   final OrderRepository _orderRepository = OrderRepository();
   final ProductRepository _productRepository = ProductRepository();
   final ProfileRepository _profileRepository = ProfileRepository();
+  final RazorpayService _razorpayService = RazorpayService();
   final Set<String> _ratedProductIds = <String>{};
   final Map<String, int> _ratedProductValues = <String, int>{};
 
@@ -38,6 +47,12 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   bool _kidsItemsExpanded = true;
   bool _depositExpanded = true;
 
+  String? _pendingReattemptOrderId;
+  String? _pendingReattemptDeliveryDate;
+  String? _pendingReattemptDeliveryTime;
+  bool _isReattemptActionLoading = false;
+  RefundStatusResult? _refundStatus;
+
   @override
   void initState() {
     super.initState();
@@ -46,7 +61,17 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     _nonSubItemsExpanded = true;
     _kidsItemsExpanded = true;
     _depositExpanded = true;
+    _razorpayService.init(
+      onSuccess: _onRazorpayPaymentSuccess,
+      onFailure: _onRazorpayPaymentFailure,
+    );
     _loadOrder();
+  }
+
+  @override
+  void dispose() {
+    _razorpayService.dispose();
+    super.dispose();
   }
 
   Future<void> _loadOrder() async {
@@ -57,10 +82,25 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
 
     try {
       await PendingReturnStore.instance.ensureLoaded();
+      await PendingRefundStore.instance.ensureLoaded();
       final detail = await _orderRepository.getOrderDetail(widget.orderId);
       final customer = await _profileRepository.getProfile();
       final mapped = UserOrderMapper.fromHistoryItem(detail, customer: customer);
       final ratedRatings = await _loadRatedProductRatings(mapped);
+
+      RefundStatusResult? refundStatus;
+      final waitlistNum = mapped.waitlistNumber ??
+          PendingRefundStore.instance.getWaitlistNumber(mapped.id);
+      if (waitlistNum != null && waitlistNum.trim().isNotEmpty) {
+        try {
+          refundStatus = await _orderRepository.getRefundStatus(waitlistNum);
+        } catch (_) {
+          refundStatus = RefundStatusResult(
+            status: 'PENDING',
+            waitlistNumber: waitlistNum,
+          );
+        }
+      }
 
       final existingIndex =
           userOrdersList.indexWhere((order) => order.id == mapped.id);
@@ -73,6 +113,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       if (!mounted) return;
       setState(() {
         _order = mapped;
+        _refundStatus = refundStatus;
         _ratedProductIds
           ..clear()
           ..addAll(ratedRatings.keys);
@@ -512,11 +553,24 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           //     arguments: order.id,
           //   ),
           // ),
-          if (order.hasReturnFailed && !_isReturnSettled(order)) ...[
+          if (order.isReturnEscalated) ...[
             SizedBox(height: 12.h),
-            _ReturnFailedNotice(
-              reason: order.rejectionReason,
-            ),
+            _buildReturnEscalatedWarningCard(order),
+          ],
+          if (_refundStatus != null) ...[
+            SizedBox(height: 12.h),
+            _buildRefundStatusCard(_refundStatus!, order),
+          ],
+          if (order.isDeliveryReattemptEligible) ...[
+            SizedBox(height: 12.h),
+            _buildDeliveryReattemptBanner(order),
+          ],
+          if (order.isReturnReattemptPending) ...[
+            SizedBox(height: 12.h),
+            _buildReturnReattemptPendingBanner(),
+          ] else if (order.isReturnFailed && !_isReturnSettled(order)) ...[
+            SizedBox(height: 12.h),
+            _buildReturnFailedBanner(order),
           ] else if (order.isInReturnFlow) ...[
             if (_hasPickupDetails(order)) ...[
               SizedBox(height: 14.h),
@@ -528,7 +582,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           SizedBox(height: 14.h),
           ..._buildSeparatedKitItemsCards(order),
           SizedBox(height: 18.h),
-          _buildTrackButton(order),
+          _buildActionButtons(order),
           SizedBox(height: 24.h),
           _buildAmountPaidSummaryCard(order),
           SizedBox(height: 24.h),
@@ -1101,47 +1155,585 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     return text;
   }
 
-  Widget _buildTrackButton(UserOrder order) {
-    final opensReturn = order.actionFlow == OrderActionFlow.delivered;
-    final opensTracking = order.actionFlow == OrderActionFlow.forward ||
-        order.actionFlow == OrderActionFlow.reverse;
+  Widget _buildRefundStatusCard(RefundStatusResult status, UserOrder order) {
+    Color badgeColor;
+    Color badgeBg;
+    String badgeText;
+    IconData badgeIcon;
+    String descText;
 
-    return SizedBox(
-      height: 46.h,
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: opensReturn
-            ? () => _openReturnOrder(order)
-            : opensTracking
-                ? () => Navigator.pushNamed(
-                      context,
-                      AppRoutes.orderTrackingScreen,
-                      arguments: order.id,
-                    )
-                : null,
-        style: ElevatedButton.styleFrom(
-          backgroundColor: const Color(0xFFD8B26A),
-          disabledBackgroundColor: const Color(0xFFD8B26A),
-          foregroundColor: Colors.black,
-          disabledForegroundColor: Colors.black54,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
+    if (status.isApproved) {
+      badgeColor = const Color(0xFF10B981);
+      badgeBg = const Color(0xFF10B981).withValues(alpha: 0.15);
+      badgeText = 'REFUND APPROVED';
+      badgeIcon = Icons.check_circle_rounded;
+      descText =
+          'Your refund request has been approved. The amount will be credited to your original payment method.';
+    } else if (status.isRejected) {
+      badgeColor = const Color(0xFFEF4444);
+      badgeBg = const Color(0xFFEF4444).withValues(alpha: 0.15);
+      badgeText = 'REFUND REJECTED';
+      badgeIcon = Icons.cancel_rounded;
+      descText =
+          'Your refund request could not be approved. Please contact customer support for further assistance.';
+    } else {
+      badgeColor = const Color(0xFFF59E0B);
+      badgeBg = const Color(0xFFF59E0B).withValues(alpha: 0.15);
+      badgeText = 'REFUND PENDING APPROVAL';
+      badgeIcon = Icons.hourglass_top_rounded;
+      descText =
+          'Your cancellation & refund request is under review by our operations team. You will be notified once processed.';
+    }
+
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF12141C),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: badgeColor.withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 8.w, vertical: 4.h),
+                decoration: BoxDecoration(
+                  color: badgeBg,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: badgeColor.withValues(alpha: 0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(badgeIcon, color: badgeColor, size: 14),
+                    SizedBox(width: 5.w),
+                    Text(
+                      badgeText,
+                      style: TextStyle(
+                        color: badgeColor,
+                        fontSize: 10.5.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.6,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Spacer(),
+              Text(
+                'REFUND',
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: 10.fSize,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 1.0,
+                ),
+              ),
+            ],
           ),
-          elevation: 2,
-        ),
-        icon: Icon(
-          opensReturn ? Icons.refresh_rounded : Icons.near_me_outlined,
-          size: 18,
-        ),
-        label: Text(
-          order.actionLabel,
-          style: TextStyle(
-            fontSize: 13.fSize,
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.5,
+          SizedBox(height: 10.h),
+          Text(
+            descText,
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: 12.fSize,
+              height: 1.35,
+            ),
           ),
+          SizedBox(height: 10.h),
+          Divider(color: Colors.white.withValues(alpha: 0.08), height: 1),
+          SizedBox(height: 10.h),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'WAITLIST NUMBER',
+                    style: TextStyle(
+                      color: Colors.white38,
+                      fontSize: 9.5.fSize,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                  SizedBox(height: 2.h),
+                  Text(
+                    status.waitlistNumber,
+                    style: TextStyle(
+                      color: const Color(0xFFD8B26A),
+                      fontSize: 13.fSize,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    'REFUND AMOUNT',
+                    style: TextStyle(
+                      color: Colors.white38,
+                      fontSize: 9.5.fSize,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                  SizedBox(height: 2.h),
+                  Text(
+                    '₹${status.amount ?? order.totalAmount}',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 13.fSize,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDeliveryReattemptBanner(UserOrder order) {
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [
+            Color(0xFF261D10),
+            Color(0xFF1A1510),
+          ],
+        ),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFD8B26A).withValues(alpha: 0.5),
         ),
       ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36.w,
+                height: 36.w,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFD8B26A).withValues(alpha: 0.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: const Color(0xFFD8B26A).withValues(alpha: 0.5),
+                  ),
+                ),
+                child: const Icon(
+                  Icons.replay_rounded,
+                  color: Color(0xFFD8B26A),
+                  size: 20,
+                ),
+              ),
+              SizedBox(width: 10.w),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Delivery Attempt Failed / Returned',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 13.5.fSize,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    SizedBox(height: 2.h),
+                    Text(
+                      'Schedule a new delivery date and time slot to receive your items.',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 11.5.fSize,
+                        height: 1.3,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReturnEscalatedWarningCard(UserOrder order) {
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF281216),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFEF4444),
+          width: 1.5,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: const Color(0xFFEF4444).withValues(alpha: 0.18),
+            blurRadius: 16,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 38.w,
+                height: 38.w,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEF4444).withValues(alpha: 0.18),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: const Color(0xFFEF4444).withValues(alpha: 0.5),
+                  ),
+                ),
+                child: const Center(
+                  child: Text(
+                    '⚠️',
+                    style: TextStyle(fontSize: 18),
+                  ),
+                ),
+              ),
+              SizedBox(width: 10.w),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Container(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 8.w,
+                        vertical: 3.h,
+                      ),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF45151A),
+                        borderRadius: BorderRadius.circular(4),
+                        border: Border.all(
+                          color: const Color(0xFFEF4444).withValues(alpha: 0.4),
+                        ),
+                      ),
+                      child: Text(
+                        'NO RETURN = NO NEXT DISPATCH',
+                        style: TextStyle(
+                          color: const Color(0xFFFCA5A5),
+                          fontSize: 9.5.fSize,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.7,
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 5.h),
+                    Text(
+                      'Action Required: Return Escalated',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13.5.fSize,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 10.h),
+          Text(
+            'Multiple pickup attempts have failed. Under our NO RETURN = NO NEXT DISPATCH policy, new bookings and deliveries are currently blocked until this kit is returned.',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.85),
+              fontSize: 12.fSize,
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReturnFailedBanner(UserOrder order) {
+    final scheduledDate = order.pickupDate?.trim().isNotEmpty == true
+        ? order.pickupDate!.trim()
+        : (order.deliveryDateFormatted?.trim().isNotEmpty == true
+            ? order.deliveryDateFormatted!.trim()
+            : 'Scheduled Date');
+    final scheduledTime = order.pickupTime?.trim().isNotEmpty == true
+        ? order.pickupTime!.trim()
+        : (order.deliveryTime?.trim().isNotEmpty == true
+            ? order.deliveryTime!.trim()
+            : 'Scheduled Slot');
+    final cleanReason = order.rejectionReason?.trim();
+
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1416),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFEF4444).withValues(alpha: 0.5),
+          width: 1.2,
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.3),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 36.w,
+                height: 36.w,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFEF4444).withValues(alpha: 0.15),
+                  shape: BoxShape.circle,
+                  border: Border.all(
+                    color: const Color(0xFFEF4444).withValues(alpha: 0.4),
+                  ),
+                ),
+                child: const Icon(
+                  Icons.error_outline_rounded,
+                  color: Color(0xFFEF4444),
+                  size: 20,
+                ),
+              ),
+              SizedBox(width: 10.w),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'RETURN FAILED',
+                      style: TextStyle(
+                        color: const Color(0xFFEF4444),
+                        fontSize: 13.5.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.8,
+                      ),
+                    ),
+                    SizedBox(height: 2.h),
+                    Text(
+                      'Pickup scheduled for $scheduledDate at $scheduledTime was not completed.',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 11.5.fSize,
+                        height: 1.35,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          if (cleanReason != null && cleanReason.isNotEmpty) ...[
+            SizedBox(height: 8.h),
+            Container(
+              width: double.infinity,
+              padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 6.h),
+              decoration: BoxDecoration(
+                color: const Color(0xFF28181A),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                'Failure Reason: $cleanReason',
+                style: TextStyle(
+                  color: Colors.white60,
+                  fontSize: 11.fSize,
+                  fontStyle: FontStyle.italic,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReturnReattemptPendingBanner() {
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1A10),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 36.w,
+            height: 36.w,
+            decoration: BoxDecoration(
+              color: const Color(0xFFF59E0B).withValues(alpha: 0.15),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+              ),
+            ),
+            child: const Icon(
+              Icons.hourglass_top_rounded,
+              color: Color(0xFFF59E0B),
+              size: 18,
+            ),
+          ),
+          SizedBox(width: 10.w),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Pickup Reschedule In Progress',
+                  style: TextStyle(
+                    color: const Color(0xFFF59E0B),
+                    fontSize: 13.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SizedBox(height: 3.h),
+                Text(
+                  'Your request to reschedule the return pickup has been submitted and is currently being processed by our operations team.',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11.5.fSize,
+                    height: 1.3,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildActionButtons(UserOrder order) {
+    final isDeliveryReattempt = order.isDeliveryReattemptEligible;
+    final isReturnPending = order.isReturnReattemptPending;
+    final isReturnReattempt =
+        !isReturnPending && order.isReturnFailed && !_isReturnSettled(order);
+    final opensReturn =
+        !isReturnReattempt && order.actionFlow == OrderActionFlow.delivered;
+    final opensTracking = !isDeliveryReattempt &&
+        !isReturnReattempt &&
+        (order.actionFlow == OrderActionFlow.forward ||
+            order.actionFlow == OrderActionFlow.reverse);
+
+    final showRefundButton = order.isRefundEligible && _refundStatus == null;
+
+    String primaryButtonLabel;
+    IconData primaryButtonIcon;
+    VoidCallback? onPrimaryPressed;
+
+    if (isDeliveryReattempt) {
+      primaryButtonLabel = 'Schedule Delivery Reattempt';
+      primaryButtonIcon = Icons.replay_rounded;
+      onPrimaryPressed = _isReattemptActionLoading
+          ? null
+          : () => _startDeliveryReattemptFlow(order);
+    } else if (isReturnPending) {
+      primaryButtonLabel = 'Pickup Reschedule In Progress';
+      primaryButtonIcon = Icons.hourglass_top_rounded;
+      onPrimaryPressed = null;
+    } else if (isReturnReattempt) {
+      primaryButtonLabel = '⇪ REATTEMPT PICKUP';
+      primaryButtonIcon = Icons.upgrade_rounded;
+      onPrimaryPressed = () => _openReattemptPickupBottomSheet(order);
+    } else if (opensReturn) {
+      primaryButtonLabel = 'Request Kit Return Pickup';
+      primaryButtonIcon = Icons.refresh_rounded;
+      onPrimaryPressed = () => _openReturnOrder(order);
+    } else if (opensTracking) {
+      primaryButtonLabel = order.actionLabel;
+      primaryButtonIcon = Icons.near_me_outlined;
+      onPrimaryPressed = () => Navigator.pushNamed(
+            context,
+            AppRoutes.orderTrackingScreen,
+            arguments: order.id,
+          );
+    } else {
+      primaryButtonLabel = order.actionLabel;
+      primaryButtonIcon = Icons.near_me_outlined;
+      onPrimaryPressed = null;
+    }
+
+    return Column(
+      children: [
+        SizedBox(
+          height: 48.h,
+          width: double.infinity,
+          child: ElevatedButton.icon(
+            onPressed: onPrimaryPressed,
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFD8B26A),
+              disabledBackgroundColor: const Color(0xFF4A402D),
+              foregroundColor: Colors.black,
+              disabledForegroundColor: Colors.white38,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              elevation: 2,
+            ),
+            icon: Icon(primaryButtonIcon, size: 18),
+            label: Text(
+              primaryButtonLabel,
+              style: TextStyle(
+                fontSize: 13.fSize,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+        ),
+        if (showRefundButton) ...[
+          SizedBox(height: 12.h),
+          SizedBox(
+            height: 44.h,
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _openRefundBottomSheet(order),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(
+                  color: const Color(0xFFD8B26A).withValues(alpha: 0.6),
+                ),
+                foregroundColor: const Color(0xFFD8B26A),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              icon: const Icon(Icons.currency_rupee_rounded, size: 17),
+              label: Text(
+                'Request Refund / Cancellation',
+                style: TextStyle(
+                  fontSize: 12.5.fSize,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
     );
   }
 
@@ -1163,6 +1755,1466 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         arguments: order.id,
       );
     }
+  }
+
+  Future<void> _openRescheduleReturnOrder(UserOrder order) async {
+    final submitted = await Navigator.pushNamed(
+      context,
+      AppRoutes.returnOrderScreen,
+      arguments: <String, dynamic>{
+        'orderId': order.id,
+        'orderNumber': order.orderIdDisplay,
+        'isReattempt': true,
+        'failureReason': order.rejectionReason,
+      },
+    );
+    if (submitted == true && mounted) {
+      await _loadOrder();
+    }
+  }
+
+  Future<void> _openReattemptPickupBottomSheet(UserOrder order) async {
+    List<SavedAddress> addresses = List<SavedAddress>.from(userSavedAddresses);
+    if (addresses.isEmpty) {
+      try {
+        await loadSavedAddressesFromProfile();
+        addresses = List<SavedAddress>.from(userSavedAddresses);
+      } catch (_) {}
+    }
+
+    String? selectedAddressId;
+    final orderAddrId = order.customerAddressId?.trim();
+    if (orderAddrId != null &&
+        orderAddrId.isNotEmpty &&
+        addresses.any((a) => a.id == orderAddrId)) {
+      selectedAddressId = orderAddrId;
+    } else if (addresses.isNotEmpty) {
+      selectedAddressId = addresses.first.id;
+    }
+
+    DateTime selectedDate = DateTime.now().add(const Duration(days: 1));
+    const returnSlots = [
+      '09:00 AM - 12:00 PM',
+      '12:00 PM - 03:00 PM',
+      '03:00 PM - 06:00 PM',
+    ];
+    String selectedSlot = returnSlots.first;
+    final noteController = TextEditingController();
+    bool isSubmitting = false;
+
+    final reattemptCount = order.returnReattemptCount;
+    final isFirstReattempt = reattemptCount <= 0;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF12141A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (modalContext, setModalState) {
+            final bottomPadding = MediaQuery.of(modalContext).viewInsets.bottom;
+            final selectedAddress = addresses.firstWhere(
+              (a) => a.id == selectedAddressId,
+              orElse: () => addresses.isNotEmpty
+                  ? addresses.first
+                  : const SavedAddress(
+                      id: '',
+                      title: 'Delivery Address',
+                      addressLines: 'Address will be confirmed',
+                      mobileDisplay: '',
+                    ),
+            );
+
+            return Padding(
+              padding: EdgeInsets.fromLTRB(
+                20.w,
+                16.h,
+                20.w,
+                24.h + bottomPadding,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Handle bar
+                    Center(
+                      child: Container(
+                        width: 44.w,
+                        height: 4.h,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+
+                    // Header row
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          'Schedule Return Pickup',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 17.fSize,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.of(sheetContext).pop(),
+                          icon: const Icon(
+                            Icons.close,
+                            color: Colors.white70,
+                            size: 20,
+                          ),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: 12.h),
+
+                    // Reattempt Quota Badge (Requirement 2.1)
+                    if (isFirstReattempt) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 12.w,
+                          vertical: 8.h,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF0D2818),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFF10B981)
+                                .withValues(alpha: 0.6),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.verified_outlined,
+                              color: Color(0xFF10B981),
+                              size: 18,
+                            ),
+                            SizedBox(width: 8.w),
+                            Expanded(
+                              child: Text(
+                                'Free Reattempt (1/1 Remaining)',
+                                style: TextStyle(
+                                  color: const Color(0xFF34D399),
+                                  fontSize: 12.fSize,
+                                  fontWeight: FontWeight.bold,
+                                  letterSpacing: 0.4,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ] else ...[
+                      Container(
+                        width: double.infinity,
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 12.w,
+                          vertical: 8.h,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF351508),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFFF59E0B)
+                                .withValues(alpha: 0.6),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.warning_amber_rounded,
+                              color: Color(0xFFF59E0B),
+                              size: 18,
+                            ),
+                            SizedBox(width: 8.w),
+                            Expanded(
+                              child: Text(
+                                'Final attempt before account dispatch hold is triggered.',
+                                style: TextStyle(
+                                  color: const Color(0xFFFBBF24),
+                                  fontSize: 12.fSize,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                    SizedBox(height: 16.h),
+
+                    // Pickup Address Selector
+                    Text(
+                      'PICKUP ADDRESS',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    Container(
+                      padding: EdgeInsets.all(12.w),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF191B24),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: Colors.white.withValues(alpha: 0.1),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          const Icon(
+                            Icons.location_on_outlined,
+                            color: Color(0xFFD8B26A),
+                            size: 20,
+                          ),
+                          SizedBox(width: 10.w),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  selectedAddress.title.isNotEmpty
+                                      ? selectedAddress.title
+                                      : 'Pickup Location',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13.fSize,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                                SizedBox(height: 2.h),
+                                Text(
+                                  selectedAddress.addressLines.isNotEmpty
+                                      ? selectedAddress.addressLines
+                                      : (order.addressLines.isNotEmpty
+                                          ? order.addressLines
+                                          : 'Default Delivery Address'),
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 11.5.fSize,
+                                  ),
+                                  maxLines: 2,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          ),
+                          if (addresses.length > 1) ...[
+                            TextButton(
+                              onPressed: () async {
+                                final pickedId = await showDialog<String>(
+                                  context: modalContext,
+                                  builder: (dialogCtx) => SimpleDialog(
+                                    backgroundColor: const Color(0xFF16181F),
+                                    title: Text(
+                                      'Select Pickup Address',
+                                      style: TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 15.fSize,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    children: addresses.map((addr) {
+                                      final isSelected =
+                                          addr.id == selectedAddressId;
+                                      return ListTile(
+                                        title: Text(
+                                          addr.title,
+                                          style: TextStyle(
+                                            color: isSelected
+                                                ? const Color(0xFFD8B26A)
+                                                : Colors.white,
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 13.fSize,
+                                          ),
+                                        ),
+                                        subtitle: Text(
+                                          addr.addressLines,
+                                          style: TextStyle(
+                                            color: Colors.white60,
+                                            fontSize: 11.fSize,
+                                          ),
+                                          maxLines: 2,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                        trailing: isSelected
+                                            ? const Icon(
+                                                Icons.check_circle_rounded,
+                                                color: Color(0xFFD8B26A),
+                                                size: 20,
+                                              )
+                                            : null,
+                                        onTap: () =>
+                                            Navigator.pop(dialogCtx, addr.id),
+                                      );
+                                    }).toList(),
+                                  ),
+                                );
+                                if (pickedId != null) {
+                                  setModalState(
+                                      () => selectedAddressId = pickedId);
+                                }
+                              },
+                              child: Text(
+                                'Change',
+                                style: TextStyle(
+                                  color: const Color(0xFFD8B26A),
+                                  fontSize: 12.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+
+                    // Date Picker
+                    Text(
+                      'PICKUP DATE',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    InkWell(
+                      onTap: () async {
+                        final picked = await showDatePicker(
+                          context: modalContext,
+                          initialDate: selectedDate,
+                          firstDate: DateTime.now(),
+                          lastDate: DateTime.now()
+                              .add(const Duration(days: 14)),
+                          builder: (context, child) {
+                            return Theme(
+                              data: ThemeData.dark().copyWith(
+                                colorScheme: const ColorScheme.dark(
+                                  primary: Color(0xFFD8B26A),
+                                  onPrimary: Colors.black,
+                                  surface: Color(0xFF1E2028),
+                                  onSurface: Colors.white,
+                                ),
+                              ),
+                              child: child!,
+                            );
+                          },
+                        );
+                        if (picked != null) {
+                          setModalState(() => selectedDate = picked);
+                        }
+                      },
+                      child: Container(
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 14.w,
+                          vertical: 12.h,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF191B24),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.1),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Row(
+                              children: [
+                                const Icon(
+                                  Icons.calendar_today_outlined,
+                                  color: Color(0xFFD8B26A),
+                                  size: 18,
+                                ),
+                                SizedBox(width: 10.w),
+                                Text(
+                                  '${selectedDate.day.toString().padLeft(2, '0')}/${selectedDate.month.toString().padLeft(2, '0')}/${selectedDate.year}',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13.5.fSize,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            Text(
+                              'Change Date',
+                              style: TextStyle(
+                                color: const Color(0xFFD8B26A),
+                                fontSize: 12.fSize,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+
+                    // Time Slot Selector
+                    Text(
+                      'PICKUP TIME SLOT',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    Wrap(
+                      spacing: 8.w,
+                      runSpacing: 8.h,
+                      children: returnSlots.map((slot) {
+                        final isSelected = slot == selectedSlot;
+                        return ChoiceChip(
+                          label: Text(
+                            slot,
+                            style: TextStyle(
+                              color: isSelected ? Colors.black : Colors.white70,
+                              fontSize: 11.5.fSize,
+                              fontWeight: isSelected
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
+                          selected: isSelected,
+                          selectedColor: const Color(0xFFD8B26A),
+                          backgroundColor: const Color(0xFF1A1D27),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            side: BorderSide(
+                              color: isSelected
+                                  ? const Color(0xFFD8B26A)
+                                  : Colors.white.withValues(alpha: 0.15),
+                            ),
+                          ),
+                          onSelected: (_) {
+                            setModalState(() => selectedSlot = slot);
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    SizedBox(height: 16.h),
+
+                    // Notes / Instructions
+                    Text(
+                      'NOTES / INSTRUCTIONS (OPTIONAL)',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    TextField(
+                      controller: noteController,
+                      maxLines: 2,
+                      style:
+                          TextStyle(color: Colors.white, fontSize: 13.fSize),
+                      decoration: InputDecoration(
+                        hintText:
+                            'Add landmarks or pickup notes (e.g., Available at home)...',
+                        hintStyle: TextStyle(
+                          color: Colors.white30,
+                          fontSize: 12.fSize,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF1A1D27),
+                        contentPadding: EdgeInsets.all(12.w),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 20.h),
+
+                    // Submit Button
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48.h,
+                      child: ElevatedButton(
+                        onPressed: isSubmitting
+                            ? null
+                            : () async {
+                                setModalState(() => isSubmitting = true);
+                                try {
+                                  Customer? customer;
+                                  try {
+                                    customer =
+                                        await _profileRepository.getProfile();
+                                  } catch (_) {}
+
+                                  final dateStr =
+                                      '${selectedDate.year}-${selectedDate.month.toString().padLeft(2, '0')}-${selectedDate.day.toString().padLeft(2, '0')}';
+
+                                  final result =
+                                      await _orderRepository.reattemptReturn(
+                                    orderId: order.id,
+                                    pickupDate: dateStr,
+                                    pickupTime: selectedSlot,
+                                    addressId: selectedAddressId,
+                                    note: noteController.text.trim(),
+                                    fullName: customer?.fullName ??
+                                        order.pickupFullName ??
+                                        'Customer',
+                                    mobile: customer?.mobile ??
+                                        order.pickupMobile ??
+                                        '',
+                                  );
+
+                                  await PendingReturnStore.instance
+                                      .mark(order.id);
+                                  markUserOrderReturnSubmitted(order.id);
+
+                                  if (!mounted) return;
+                                  Navigator.of(sheetContext).pop();
+
+                                  CustomAppSnackBar.showSuccess(
+                                    context,
+                                    result.message.isNotEmpty
+                                        ? result.message
+                                        : 'Return pickup scheduled successfully.',
+                                  );
+
+                                  if (mounted) {
+                                    await _loadOrder();
+                                  }
+                                } on ApiException catch (e) {
+                                  if (e.isNoReturnBlocked) {
+                                    if (!mounted) return;
+                                    Navigator.of(sheetContext).pop();
+                                    await showNoReturnBlockedDialog(
+                                      context,
+                                      overdueOrderNumber:
+                                          e.overdueOrderNumber,
+                                      message: e.message,
+                                    );
+                                  } else {
+                                    setModalState(() => isSubmitting = false);
+                                    if (!mounted) return;
+                                    CustomAppSnackBar.showError(
+                                        context, e.message);
+                                  }
+                                } catch (_) {
+                                  setModalState(() => isSubmitting = false);
+                                  if (!mounted) return;
+                                  CustomAppSnackBar.showError(
+                                    context,
+                                    'Failed to schedule return pickup. Please try again.',
+                                  );
+                                }
+                              },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFD8B26A),
+                          foregroundColor: Colors.black,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          elevation: 2,
+                        ),
+                        child: isSubmitting
+                            ? const SizedBox(
+                                width: 22,
+                                height: 22,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.black,
+                                ),
+                              )
+                            : Text(
+                                'Confirm Return Pickup',
+                                style: TextStyle(
+                                  fontSize: 14.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _startDeliveryReattemptFlow(UserOrder order) async {
+    setState(() => _isReattemptActionLoading = true);
+    try {
+      final quote = await _orderRepository.getReattemptQuote(order.id);
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      _showReattemptQuoteSheet(order, quote);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(context, e.message);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(
+        context,
+        'Unable to retrieve delivery reattempt quote. Please try again.',
+      );
+    }
+  }
+
+  Future<void> _showReattemptQuoteSheet(
+    UserOrder order,
+    ReattemptQuote quote,
+  ) async {
+    DateTime selectedDate = DateTime.now().add(const Duration(days: 1));
+    const slots = [
+      '10:00 AM - 01:00 PM',
+      '01:00 PM - 04:00 PM',
+      '04:00 PM - 07:00 PM',
+      '07:00 PM - 10:00 PM',
+    ];
+    String selectedSlot = slots.first;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF12141A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final y = selectedDate.year;
+            final m = selectedDate.month.toString().padLeft(2, '0');
+            final d = selectedDate.day.toString().padLeft(2, '0');
+            final apiDateStr = '$y-$m-$d';
+            final displayDateStr = '$d/$m/$y';
+
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 20.w,
+                right: 20.w,
+                top: 20.h,
+                bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 20.h,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40.w,
+                        height: 4.h,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.local_shipping_outlined,
+                          color: Color(0xFFD8B26A),
+                          size: 22,
+                        ),
+                        SizedBox(width: 8.w),
+                        Text(
+                          'Schedule Delivery Reattempt',
+                          style: TextStyle(
+                            color: const Color(0xFFD8B26A),
+                            fontSize: 16.fSize,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: 14.h),
+                    Container(
+                      padding: EdgeInsets.all(14.w),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A1D27),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: const Color(0xFFD8B26A).withValues(alpha: 0.35),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                'Delivery Charge',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12.5.fSize,
+                                ),
+                              ),
+                              Text(
+                                quote.isFreeReattempt || quote.deliveryCharge <= 0
+                                    ? 'FREE'
+                                    : '₹${quote.deliveryCharge}',
+                                style: TextStyle(
+                                  color: quote.isFreeReattempt ||
+                                          quote.deliveryCharge <= 0
+                                      ? const Color(0xFF10B981)
+                                      : Colors.white,
+                                  fontSize: 13.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          if (quote.distanceKm > 0) ...[
+                            SizedBox(height: 8.h),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  'Delivery Distance',
+                                  style: TextStyle(
+                                    color: Colors.white70,
+                                    fontSize: 12.5.fSize,
+                                  ),
+                                ),
+                                Text(
+                                  '${quote.distanceKm} km',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13.fSize,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                          SizedBox(height: 10.h),
+                          Divider(
+                            color: Colors.white.withValues(alpha: 0.1),
+                            height: 1,
+                          ),
+                          SizedBox(height: 10.h),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                'Total Payable',
+                                style: TextStyle(
+                                  color: const Color(0xFFD8B26A),
+                                  fontSize: 13.5.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              Text(
+                                quote.totalPayable <= 0
+                                    ? 'FREE'
+                                    : '₹${quote.totalPayable}',
+                                style: TextStyle(
+                                  color: quote.totalPayable <= 0
+                                      ? const Color(0xFF10B981)
+                                      : const Color(0xFFD8B26A),
+                                  fontSize: 16.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(height: 18.h),
+                    Text(
+                      'SELECT DELIVERY DATE',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    InkWell(
+                      onTap: () async {
+                        final picked = await showDatePicker(
+                          context: context,
+                          initialDate: selectedDate,
+                          firstDate: DateTime.now(),
+                          lastDate: DateTime.now().add(const Duration(days: 14)),
+                          builder: (context, child) {
+                            return Theme(
+                              data: Theme.of(context).copyWith(
+                                colorScheme: const ColorScheme.dark(
+                                  primary: Color(0xFFD8B26A),
+                                  onPrimary: Colors.black,
+                                  surface: Color(0xFF1A1D27),
+                                  onSurface: Colors.white,
+                                ),
+                              ),
+                              child: child!,
+                            );
+                          },
+                        );
+                        if (picked != null) {
+                          setSheetState(() => selectedDate = picked);
+                        }
+                      },
+                      borderRadius: BorderRadius.circular(10),
+                      child: Container(
+                        padding:
+                            EdgeInsets.symmetric(horizontal: 14.w, vertical: 12.h),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF1A1D27),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFFD8B26A).withValues(alpha: 0.4),
+                          ),
+                        ),
+                        child: Row(
+                          children: [
+                            const Icon(
+                              Icons.calendar_today_rounded,
+                              color: Color(0xFFD8B26A),
+                              size: 18,
+                            ),
+                            SizedBox(width: 10.w),
+                            Text(
+                              displayDateStr,
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 13.5.fSize,
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            const Spacer(),
+                            Text(
+                              'Change',
+                              style: TextStyle(
+                                color: const Color(0xFFD8B26A),
+                                fontSize: 12.fSize,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 18.h),
+                    Text(
+                      'SELECT DELIVERY TIME SLOT',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    Wrap(
+                      spacing: 8.w,
+                      runSpacing: 8.h,
+                      children: slots.map((slot) {
+                        final isSelected = selectedSlot == slot;
+                        return ChoiceChip(
+                          label: Text(
+                            slot,
+                            style: TextStyle(
+                              color: isSelected ? Colors.black : Colors.white70,
+                              fontSize: 11.5.fSize,
+                              fontWeight: isSelected
+                                  ? FontWeight.bold
+                                  : FontWeight.normal,
+                            ),
+                          ),
+                          selected: isSelected,
+                          selectedColor: const Color(0xFFD8B26A),
+                          backgroundColor: const Color(0xFF1A1D27),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            side: BorderSide(
+                              color: isSelected
+                                  ? const Color(0xFFD8B26A)
+                                  : Colors.white12,
+                            ),
+                          ),
+                          onSelected: (val) {
+                            if (val) {
+                              setSheetState(() => selectedSlot = slot);
+                            }
+                          },
+                        );
+                      }).toList(),
+                    ),
+                    SizedBox(height: 24.h),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 48.h,
+                      child: ElevatedButton(
+                        onPressed: () {
+                          Navigator.pop(sheetContext);
+                          _submitDeliveryReorder(
+                            order,
+                            quote,
+                            apiDateStr,
+                            selectedSlot,
+                          );
+                        },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFD8B26A),
+                          foregroundColor: Colors.black,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          elevation: 2,
+                        ),
+                        child: Text(
+                          quote.totalPayable > 0
+                              ? 'Pay ₹${quote.totalPayable} & Schedule'
+                              : 'Schedule Delivery Reattempt',
+                          style: TextStyle(
+                            fontSize: 13.5.fSize,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _submitDeliveryReorder(
+    UserOrder order,
+    ReattemptQuote quote,
+    String deliveryDate,
+    String deliveryTime,
+  ) async {
+    setState(() => _isReattemptActionLoading = true);
+
+    try {
+      final res = await _orderRepository.reorderDelivery(
+        orderId: order.id,
+        deliveryDate: deliveryDate,
+        deliveryTime: deliveryTime,
+      );
+
+      if (res.paymentRequired) {
+        _pendingReattemptOrderId = order.id;
+        _pendingReattemptDeliveryDate = deliveryDate;
+        _pendingReattemptDeliveryTime = deliveryTime;
+
+        Customer? customer;
+        try {
+          customer = await _profileRepository.getProfile();
+        } catch (_) {}
+
+        final keyId = res.razorpayKeyId ?? 'rzp_test_51O2aL2a';
+        final amountPaise = res.amount > 0
+            ? res.amount
+            : (quote.totalPayable * 100).round();
+
+        _razorpayService.openCheckout(
+          keyId: keyId,
+          orderId: res.razorpayOrderId ?? '',
+          amount: amountPaise,
+          currency: res.currency,
+          name: customer?.fullName,
+          email: customer?.email,
+          contact: customer?.mobile,
+          description: 'Delivery reattempt for Order #${order.orderIdDisplay}',
+        );
+      } else {
+        if (!mounted) return;
+        setState(() => _isReattemptActionLoading = false);
+
+        await showDialog<void>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            backgroundColor: const Color(0xFF16181D),
+            title: Row(
+              children: [
+                const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981)),
+                const SizedBox(width: 8),
+                Text(
+                  'Reattempt Scheduled',
+                  style: TextStyle(
+                    color: AppColours.primary,
+                    fontSize: 16.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ],
+            ),
+            content: Text(
+              res.message ??
+                  'Your delivery reattempt has been scheduled for $deliveryDate ($deliveryTime).',
+              style: TextStyle(color: Colors.white70, fontSize: 14.fSize),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: Text('OK', style: TextStyle(color: AppColours.primary)),
+              ),
+            ],
+          ),
+        );
+
+        await _loadOrder();
+      }
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(context, e.message);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(
+        context,
+        'Failed to schedule delivery reattempt. Please try again.',
+      );
+    }
+  }
+
+  Future<void> _onRazorpayPaymentSuccess(
+    PaymentSuccessResponse response,
+  ) async {
+    final orderId = _pendingReattemptOrderId ?? widget.orderId;
+    final date = _pendingReattemptDeliveryDate ?? '';
+    final time = _pendingReattemptDeliveryTime ?? '';
+
+    final paymentId = response.paymentId?.trim() ?? '';
+    final razorpayOrderId = response.orderId?.trim() ?? '';
+    final signature = response.signature?.trim() ?? '';
+
+    setState(() => _isReattemptActionLoading = true);
+
+    try {
+      final res = await _orderRepository.reorderDelivery(
+        orderId: orderId,
+        deliveryDate: date,
+        deliveryTime: time,
+        razorpayPaymentId: paymentId,
+        razorpayOrderId: razorpayOrderId,
+        razorpaySignature: signature,
+      );
+
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF16181D),
+          title: Row(
+            children: [
+              const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981)),
+              const SizedBox(width: 8),
+              Text(
+                'Payment Confirmed',
+                style: TextStyle(
+                  color: AppColours.primary,
+                  fontSize: 16.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          content: Text(
+            res.message ??
+                'Payment verified! Delivery reattempt has been scheduled successfully.',
+            style: TextStyle(color: Colors.white70, fontSize: 14.fSize),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: Text('OK', style: TextStyle(color: AppColours.primary)),
+            ),
+          ],
+        ),
+      );
+
+      await _loadOrder();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(context, e.message);
+    } catch (_) {
+      if (!mounted) return;
+      setState(() => _isReattemptActionLoading = false);
+      CustomAppSnackBar.showError(
+        context,
+        'Failed to confirm delivery reattempt payment.',
+      );
+    }
+  }
+
+  void _onRazorpayPaymentFailure(PaymentFailureResponse response) {
+    if (!mounted) return;
+    setState(() => _isReattemptActionLoading = false);
+    final msg = response.message?.trim();
+    CustomAppSnackBar.showError(
+      context,
+      (msg != null && msg.isNotEmpty)
+          ? 'Payment failed: $msg'
+          : 'Payment cancelled or failed. Please try again.',
+    );
+  }
+
+  Future<void> _openRefundBottomSheet(UserOrder order) async {
+    const reasons = [
+      'Order placed by mistake',
+      'Delivery time too late',
+      'Need to change delivery address or items',
+      'Found a better alternative',
+      'Other',
+    ];
+
+    String selectedReason = reasons.first;
+    final notesController = TextEditingController();
+    bool isSubmitting = false;
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF12141A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (bottomSheetContext) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 20.w,
+                right: 20.w,
+                top: 20.h,
+                bottom:
+                    MediaQuery.of(bottomSheetContext).viewInsets.bottom + 20.h,
+              ),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40.w,
+                        height: 4.h,
+                        decoration: BoxDecoration(
+                          color: Colors.white24,
+                          borderRadius: BorderRadius.circular(2),
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+                    Row(
+                      children: [
+                        const Icon(
+                          Icons.currency_rupee_rounded,
+                          color: Color(0xFFD8B26A),
+                          size: 22,
+                        ),
+                        SizedBox(width: 8.w),
+                        Text(
+                          'Request Refund / Cancellation',
+                          style: TextStyle(
+                            color: const Color(0xFFD8B26A),
+                            fontSize: 16.fSize,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                    SizedBox(height: 14.h),
+                    Container(
+                      padding: EdgeInsets.all(12.w),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A1D27),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(
+                          color: const Color(0xFFD8B26A).withValues(alpha: 0.3),
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                'Order Number',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12.fSize,
+                                ),
+                              ),
+                              Text(
+                                order.orderIdDisplay,
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12.5.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          SizedBox(height: 8.h),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                'Refund Amount',
+                                style: TextStyle(
+                                  color: Colors.white70,
+                                  fontSize: 12.fSize,
+                                ),
+                              ),
+                              Text(
+                                '₹${order.totalAmount}',
+                                style: TextStyle(
+                                  color: const Color(0xFF10B981),
+                                  fontSize: 14.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    SizedBox(height: 16.h),
+                    Text(
+                      'SELECT REASON',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    Container(
+                      padding: EdgeInsets.symmetric(horizontal: 12.w),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF1A1D27),
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: Colors.white12),
+                      ),
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<String>(
+                          value: selectedReason,
+                          isExpanded: true,
+                          dropdownColor: const Color(0xFF1E222D),
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 13.fSize,
+                          ),
+                          items: reasons
+                              .map(
+                                (r) => DropdownMenuItem(
+                                  value: r,
+                                  child: Text(r),
+                                ),
+                              )
+                              .toList(),
+                          onChanged: (val) {
+                            if (val != null) {
+                              setModalState(() => selectedReason = val);
+                            }
+                          },
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 14.h),
+                    Text(
+                      'ADDITIONAL DETAILS (OPTIONAL)',
+                      style: TextStyle(
+                        color: const Color(0xFFD8B26A),
+                        fontSize: 11.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 1.0,
+                      ),
+                    ),
+                    SizedBox(height: 8.h),
+                    TextField(
+                      controller: notesController,
+                      maxLines: 3,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 13.fSize,
+                      ),
+                      decoration: InputDecoration(
+                        hintText: 'Enter more details regarding your request...',
+                        hintStyle: TextStyle(
+                          color: Colors.white30,
+                          fontSize: 12.fSize,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF1A1D27),
+                        contentPadding: EdgeInsets.all(12.w),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                      ),
+                    ),
+                    SizedBox(height: 20.h),
+                    SizedBox(
+                      width: double.infinity,
+                      height: 46.h,
+                      child: ElevatedButton(
+                        onPressed: isSubmitting
+                            ? null
+                            : () async {
+                                setModalState(() => isSubmitting = true);
+                                final combinedReason = notesController.text.trim().isNotEmpty
+                                    ? '$selectedReason - ${notesController.text.trim()}'
+                                    : selectedReason;
+
+                                try {
+                                  Customer? customer;
+                                  try {
+                                    customer = await _profileRepository.getProfile();
+                                  } catch (_) {}
+
+                                  final waitlistNum =
+                                      await _orderRepository.submitRefundRequest(
+                                    orderId: order.id,
+                                    orderNumber: order.orderIdDisplay,
+                                    customerId:
+                                        order.customerId ?? customer?.id ?? '',
+                                    reason: combinedReason,
+                                    amount: order.totalAmount,
+                                    fullName: customer?.fullName ?? 'Customer',
+                                    mobile: customer?.mobile ?? '',
+                                    email: customer?.email,
+                                  );
+
+                                  if (!mounted) return;
+                                  Navigator.of(bottomSheetContext).pop();
+
+                                  if (!mounted) return;
+                                  await showDialog<void>(
+                                    context: context,
+                                    builder: (dialogCtx) => AlertDialog(
+                                      backgroundColor: const Color(0xFF16181D),
+                                      title: Row(
+                                        children: [
+                                          const Icon(
+                                            Icons.check_circle_rounded,
+                                            color: Color(0xFF10B981),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            'Refund Submitted',
+                                            style: TextStyle(
+                                              color: AppColours.primary,
+                                              fontSize: 16.fSize,
+                                              fontWeight: FontWeight.bold,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      content: Text(
+                                        'Your refund request for ₹${order.totalAmount} has been registered.\n\nWaitlist Reference: $waitlistNum\n\nOur team is reviewing your request.',
+                                        style: TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 13.5.fSize,
+                                          height: 1.4,
+                                        ),
+                                      ),
+                                      actions: [
+                                        TextButton(
+                                          onPressed: () =>
+                                              Navigator.pop(dialogCtx),
+                                          child: Text(
+                                            'OK',
+                                            style: TextStyle(
+                                              color: AppColours.primary,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+
+                                  if (!mounted) return;
+                                  await _loadOrder();
+                                } on ApiException catch (e) {
+                                  setModalState(() => isSubmitting = false);
+                                  if (!mounted) return;
+                                  CustomAppSnackBar.showError(context, e.message);
+                                } catch (_) {
+                                  setModalState(() => isSubmitting = false);
+                                  if (!mounted) return;
+                                  CustomAppSnackBar.showError(
+                                    context,
+                                    'Failed to submit refund request. Please try again.',
+                                  );
+                                }
+                              },
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFFD8B26A),
+                          foregroundColor: Colors.black,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        child: isSubmitting
+                            ? const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: Colors.black,
+                                ),
+                              )
+                            : Text(
+                                'Submit Refund Request',
+                                style: TextStyle(
+                                  fontSize: 13.5.fSize,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
   }
 
   Widget _buildAmountPaidSummaryCard(UserOrder order) {
