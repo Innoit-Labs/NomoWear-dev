@@ -1,6 +1,6 @@
 class ApiConstants {
   static const String baseUrl = 'https://nomowear-backend.onrender.com/';
-  // static const String baseUrl = 'http://192.168.0.15:5000';
+  // static const String baseUrl = 'https://appealing-clobber-hatchet.ngrok-free.dev';
   static const String loginPath = 'mobile/v1/login';
   static const String resendOtpPath = 'mobile/v1/resend-otp';
   static const String verifyOtpPath = 'mobile/v1/verify-otp';
@@ -49,8 +49,11 @@ class ApiConstants {
   static String orderReattemptReturnPath(String orderId) =>
       '$ordersPath/${orderId.trim()}/reattempt-return';
 
-  /// POST waitlist
+  /// POST mobile/v1/waitlist
   static const String waitlistPath = 'waitlist';
+
+  /// POST mobile/v1/waitlist — customer delivery reattempt request.
+  static const String reorderWaitlistPath = waitlistPath;
 
   /// GET waitlist/status/{idOrNumber}
   static String waitlistStatusPath(String idOrNumber) =>

@@ -1,3 +1,7 @@
+import 'dart:async';
+import 'dart:math' show pi;
+
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/core/network/api_exception.dart';
 import 'package:nomowear/core/services/razorpay_service.dart';
@@ -20,6 +24,8 @@ import 'package:nomowear/features/profile/domain/saved_address.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/product_details_screen.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
 import 'package:razorpay_flutter/razorpay_flutter.dart';
+
+const _addNewPickupAddressId = '__add_new_pickup_address__';
 
 class OrderDetailsScreen extends StatefulWidget {
   final String orderId;
@@ -45,12 +51,22 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   bool _subItemsExpanded = true;
   bool _nonSubItemsExpanded = true;
   bool _kidsItemsExpanded = true;
+  bool _essentialsItemsExpanded = true;
   bool _depositExpanded = true;
 
   String? _pendingReattemptOrderId;
   String? _pendingReattemptDeliveryDate;
   String? _pendingReattemptDeliveryTime;
   bool _isReattemptActionLoading = false;
+  ({
+    String date,
+    String time,
+    String? location,
+    String? note,
+  })? _rescheduledPickup;
+  bool _reattemptLoaderVisible = false;
+  ValueNotifier<_ReattemptDialogView>? _reattemptDialogView;
+  Completer<void>? _reattemptDialogClosed;
   RefundStatusResult? _refundStatus;
 
   @override
@@ -60,6 +76,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     _subItemsExpanded = true;
     _nonSubItemsExpanded = true;
     _kidsItemsExpanded = true;
+    _essentialsItemsExpanded = true;
     _depositExpanded = true;
     _razorpayService.init(
       onSuccess: _onRazorpayPaymentSuccess,
@@ -85,7 +102,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       await PendingRefundStore.instance.ensureLoaded();
       final detail = await _orderRepository.getOrderDetail(widget.orderId);
       final customer = await _profileRepository.getProfile();
-      final mapped = UserOrderMapper.fromHistoryItem(detail, customer: customer);
+      final mapped = _withRescheduledPickup(
+        UserOrderMapper.fromHistoryItem(detail, customer: customer),
+      );
       final ratedRatings = await _loadRatedProductRatings(mapped);
 
       RefundStatusResult? refundStatus;
@@ -440,6 +459,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
+      resizeToAvoidBottomInset: false,
       body: SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -557,32 +577,46 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
             SizedBox(height: 12.h),
             _buildReturnEscalatedWarningCard(order),
           ],
-          if (_refundStatus != null) ...[
+          if (order.isRefundCompleted) ...[
+            if (_hasCompletedRefundDetails(order)) ...[
+            SizedBox(height: 12.h),
+              _buildRefundCompletedCard(order),
+            ],
+          ] else if (_refundStatus != null) ...[
             SizedBox(height: 12.h),
             _buildRefundStatusCard(_refundStatus!, order),
           ],
-          if (order.isDeliveryReattemptEligible) ...[
+          if (order.isReorderRequested &&
+              !order.isRefundCompleted &&
+              (_refundStatus == null || _refundStatus!.isRejected)) ...[
+            SizedBox(height: 12.h),
+            _buildReorderRequestedBanner(),
+          ] else if (order.isDeliveryReattemptEligible &&
+              !order.isRefundCompleted &&
+              (_refundStatus == null || _refundStatus!.isRejected)) ...[
             SizedBox(height: 12.h),
             _buildDeliveryReattemptBanner(order),
           ],
-          if (order.isReturnReattemptPending) ...[
+          if (order.isReturnReattemptPending &&
+              !order.isRefundCompleted &&
+              (_refundStatus == null || _refundStatus!.isRejected)) ...[
             SizedBox(height: 12.h),
             _buildReturnReattemptPendingBanner(),
-          ] else if (order.isReturnFailed && !_isReturnSettled(order)) ...[
+          ] else if (order.isReturnFailed &&
+              !_isReturnSettled(order) &&
+              !order.isRefundCompleted &&
+              (_refundStatus == null || _refundStatus!.isRejected)) ...[
             SizedBox(height: 12.h),
             _buildReturnFailedBanner(order),
-          ] else if (order.isInReturnFlow) ...[
-            if (_hasPickupDetails(order)) ...[
-              SizedBox(height: 14.h),
-              _buildPickupDetailsCard(order),
-            ],
           ],
           SizedBox(height: 20.h),
           _buildItemsHeader(),
           SizedBox(height: 14.h),
           ..._buildSeparatedKitItemsCards(order),
+          if (!order.isReturnComplete) ...[
           SizedBox(height: 18.h),
-          _buildActionButtons(order),
+            _buildActionButtons(order),
+          ],
           SizedBox(height: 24.h),
           _buildAmountPaidSummaryCard(order),
           SizedBox(height: 24.h),
@@ -664,6 +698,21 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     );
   }
 
+  bool _isPurchaseSection(String badgeLabel) {
+    return badgeLabel == 'KIDS NON RETURNABLE' ||
+        badgeLabel == 'ESSENTIALS NON RETURNABLE';
+  }
+
+  bool _isItemEssentials(OrderLineItem item) {
+    if (_isItemKids(item)) return false;
+    final type = item.itemType?.trim().toLowerCase();
+    if (type == 'essentials' || type == 'essential') return true;
+    final cat = item.category?.trim().toLowerCase() ?? '';
+    if (cat.contains('essential')) return true;
+    final name = item.productName.trim().toLowerCase();
+    return name.contains('essential');
+  }
+
   bool _isItemKids(OrderLineItem item) {
     final type = item.itemType?.trim().toLowerCase();
     if (type == 'kids' || type == 'kid') return true;
@@ -712,8 +761,19 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     }
 
     final kidsItems = items.where(_isItemKids).toList();
-    final subItems = items.where((it) => !_isItemKids(it) && _isItemSubscription(it, order)).toList();
-    final nonSubItems = items.where((it) => !_isItemKids(it) && !_isItemSubscription(it, order)).toList();
+    final essentialItems = items.where(_isItemEssentials).toList();
+    final subItems = items
+        .where((it) =>
+            !_isItemKids(it) &&
+            !_isItemEssentials(it) &&
+            _isItemSubscription(it, order))
+        .toList();
+    final nonSubItems = items
+        .where((it) =>
+            !_isItemKids(it) &&
+            !_isItemEssentials(it) &&
+            !_isItemSubscription(it, order))
+        .toList();
 
     final widgets = <Widget>[];
 
@@ -742,6 +802,24 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           isSubscription: false,
           isExpanded: _nonSubItemsExpanded,
           onToggleExpanded: () => setState(() => _nonSubItemsExpanded = !_nonSubItemsExpanded),
+        ),
+      );
+    }
+
+    if (essentialItems.isNotEmpty) {
+      if (widgets.isNotEmpty) {
+        widgets.add(SizedBox(height: 14.h));
+      }
+      widgets.add(
+        _buildSingleKitItemsCard(
+          order: order,
+          items: essentialItems,
+          badgeLabel: 'ESSENTIALS NON RETURNABLE',
+          pricePrefix: 'Subtotal',
+          isSubscription: false,
+          isExpanded: _essentialsItemsExpanded,
+          onToggleExpanded: () =>
+              setState(() => _essentialsItemsExpanded = !_essentialsItemsExpanded),
         ),
       );
     }
@@ -783,7 +861,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       for (final item in items) {
         itemsTotal += item.lineTotal > 0 ? item.lineTotal : (item.unitPrice * item.quantity);
       }
-      if (itemsTotal <= 0 && badgeLabel != 'KIDS NON RETURNABLE') {
+      if (itemsTotal <= 0 && !_isPurchaseSection(badgeLabel)) {
         itemsTotal = order.subtotal > 0 ? order.subtotal : order.kitPrice;
       }
     }
@@ -888,7 +966,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
               child: Column(
                 children: [
                   if (!isSubscription &&
-                      badgeLabel != 'KIDS NON RETURNABLE' &&
+                      !_isPurchaseSection(badgeLabel) &&
                       order.securityDepositAmount > 0) ...[
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -969,190 +1047,143 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     return settled.contains(status) || settled.contains(ret);
   }
 
-  bool _hasPickupDetails(UserOrder order) {
-    bool filled(String? value) => value != null && value.trim().isNotEmpty;
-    return filled(order.pickupDate) ||
-        filled(order.pickupTime) ||
-        filled(order.pickupNote) ||
-        filled(order.pickupMobile) ||
-        filled(order.pickupFullName);
+  UserOrder _withRescheduledPickup(UserOrder order) {
+    final local = _rescheduledPickup;
+    if (local == null) {
+      if (UserOrderMapper.isIapAddress(order.pickupAddress)) {
+        return order.copyWith(pickupAddress: null);
+      }
+      return order;
+    }
+
+    String? keep(String? current, String? fallback) {
+      final text = current?.trim() ?? '';
+      if (text.isNotEmpty && text.toLowerCase() != 'null') return current;
+      final next = fallback?.trim() ?? '';
+      return next.isEmpty ? current : fallback;
+    }
+
+    final effectiveLocation = keep(order.pickupAddress, local.location);
+    return order.copyWith(
+      pickupDate: keep(order.pickupDate, local.date),
+      pickupTime: keep(order.pickupTime, local.time),
+      pickupAddress: UserOrderMapper.isIapAddress(effectiveLocation) ? null : effectiveLocation,
+      pickupNote: keep(order.pickupNote, local.note),
+    );
   }
 
-  String _formatPickupDate(String raw) {
-    final parsed = DateTime.tryParse(raw.trim());
-    if (parsed == null) return raw.trim();
-    const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-    ];
-    final day = parsed.day.toString().padLeft(2, '0');
-    return '$day ${months[parsed.month - 1]} ${parsed.year}';
+  bool _hasCompletedRefundDetails(UserOrder order) {
+    final note = order.refundCompletedNote?.trim() ?? '';
+    return order.refundAmountLabel != null ||
+        order.refundedAt != null ||
+        note.isNotEmpty;
   }
 
-  Widget _buildPickupDetailsCard(UserOrder order) {
-    final name = _cleanPickupValue(order.pickupFullName);
-    final mobile = _cleanPickupValue(order.pickupMobile);
-    final date = _cleanPickupValue(order.pickupDate);
-    final time = _cleanPickupValue(order.pickupTime);
-    final note = _cleanPickupValue(order.pickupNote);
-    final address = _cleanPickupValue(order.addressLines);
+  Widget _buildRefundCompletedCard(UserOrder order) {
+    final amount = order.refundAmountLabel;
+    final note = order.refundCompletedNote?.trim();
+    final refundedAt = order.refundedAt;
+    final time = refundedAt == null
+        ? null
+        : UserOrderMapper.formatTrackingTimestamp(refundedAt);
 
+    const badgeColor = Color(0xFF10B981);
     return Container(
-      width: double.infinity,
       padding: EdgeInsets.all(14.w),
       decoration: BoxDecoration(
-        color: const Color(0xFF0C0D14),
+        color: const Color(0xFF12141C),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(
-          color: const Color(0xFFD8B26A).withValues(alpha: 0.35),
-        ),
+        border: Border.all(color: badgeColor.withValues(alpha: 0.4)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              Icon(
-                Icons.assignment_return_outlined,
-                color: const Color(0xFFD8B26A),
-                size: 18.w,
+              Container(
+                padding: EdgeInsets.symmetric(horizontal: 8.w, vertical: 4.h),
+                decoration: BoxDecoration(
+                  color: badgeColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: badgeColor.withValues(alpha: 0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.check_circle_rounded,
+                      color: badgeColor,
+                      size: 14,
+                    ),
+                    SizedBox(width: 5.w),
+                    Text(
+                      'REFUND COMPLETED',
+                      style: TextStyle(
+                        color: badgeColor,
+                        fontSize: 10.5.fSize,
+                        fontWeight: FontWeight.bold,
+                        letterSpacing: 0.6,
+                      ),
+                    ),
+                  ],
+                ),
               ),
-              SizedBox(width: 8.w),
+              const Spacer(),
               Text(
-                'PICKUP DETAILS',
+                'REFUND',
                 style: TextStyle(
-                  color: const Color(0xFFD8B26A),
-                  fontSize: 12.fSize,
+                  color: Colors.white38,
+                  fontSize: 10.fSize,
                   fontWeight: FontWeight.bold,
-                  letterSpacing: 0.8,
+                  letterSpacing: 1.0,
                 ),
               ),
             ],
           ),
-          if (date != null || time != null) ...[
-            SizedBox(height: 14.h),
-            Row(
-              children: [
-                if (date != null)
-                  Expanded(
-                    child: _pickupValueTile(
-                      label: 'PICKUP DATE',
-                      value: _formatPickupDate(date),
-                      icon: Icons.calendar_today_outlined,
-                    ),
-                  ),
-                if (date != null && time != null) SizedBox(width: 10.w),
-                if (time != null)
-                  Expanded(
-                    child: _pickupValueTile(
-                      label: 'PICKUP TIME',
-                      value: time,
-                      icon: Icons.schedule_outlined,
-                    ),
-                  ),
-              ],
-            ),
-          ],
-          if (name != null) ...[
+          if (amount != null) ...[
             SizedBox(height: 12.h),
-            _pickupTextBlock('NAME', name),
+            _refundDetailLine('REFUND AMOUNT', amount),
           ],
-          if (mobile != null) ...[
-            SizedBox(height: 12.h),
-            _pickupTextBlock('MOBILE', mobile),
+          if (time != null && time != 'Pending') ...[
+            SizedBox(height: 8.h),
+            _refundDetailLine('REFUNDED ON', time),
           ],
-          if (address != null) ...[
-            SizedBox(height: 12.h),
-            _pickupTextBlock('PICKUP ADDRESS', address),
-          ],
-          if (note != null) ...[
-            SizedBox(height: 12.h),
-            _pickupTextBlock('NOTE', note),
+          if (note != null && note.isNotEmpty) ...[
+            SizedBox(height: 8.h),
+            _refundDetailLine('NOTE', note),
           ],
         ],
       ),
     );
   }
 
-  Widget _pickupValueTile({
-    required String label,
-    required String value,
-    required IconData icon,
-  }) {
-    return Container(
-      padding: EdgeInsets.symmetric(horizontal: 10.w, vertical: 10.h),
-      decoration: BoxDecoration(
-        color: const Color(0xFF16181D),
-        borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFFD8B26A).withValues(alpha: 0.45)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: const Color(0xFFD8B26A), size: 13),
-              SizedBox(width: 6.w),
-              Expanded(
-                child: Text(
-                  label,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: TextStyle(
-                    color: const Color(0xFFD8B26A),
-                    fontSize: 9.fSize,
-                    fontWeight: FontWeight.w700,
-                    letterSpacing: 0.4,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 6.h),
-          Text(
-            value,
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: 13.fSize,
-              fontWeight: FontWeight.w700,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _pickupTextBlock(String label, String value) {
+  Widget _refundDetailLine(String label, String value) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
           label,
           style: TextStyle(
-            color: const Color(0xFFD8B26A),
-            fontSize: 9.fSize,
-            fontWeight: FontWeight.w700,
-            letterSpacing: 0.4,
+            color: Colors.white38,
+            fontSize: 9.5.fSize,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.8,
           ),
         ),
-        SizedBox(height: 4.h),
+        SizedBox(height: 2.h),
         Text(
           value,
           style: TextStyle(
-            color: Colors.white,
+            color: label == 'REFUND AMOUNT'
+                ? Colors.white
+                : const Color(0xFFD8B26A),
             fontSize: 13.fSize,
-            fontWeight: FontWeight.w600,
+            fontWeight: FontWeight.bold,
             height: 1.35,
           ),
         ),
       ],
     );
-  }
-
-  String? _cleanPickupValue(String? value) {
-    final text = value?.trim() ?? '';
-    if (text.isEmpty || text.toLowerCase() == 'null') return null;
-    return text;
   }
 
   Widget _buildRefundStatusCard(RefundStatusResult status, UserOrder order) {
@@ -1245,56 +1276,108 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
           SizedBox(height: 10.h),
           Divider(color: Colors.white.withValues(alpha: 0.08), height: 1),
           SizedBox(height: 10.h),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'WAITLIST NUMBER',
-                    style: TextStyle(
-                      color: Colors.white38,
-                      fontSize: 9.5.fSize,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  SizedBox(height: 2.h),
-                  Text(
-                    status.waitlistNumber,
-                    style: TextStyle(
-                      color: const Color(0xFFD8B26A),
-                      fontSize: 13.fSize,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
+              Text(
+                'WAITLIST NUMBER',
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: 9.5.fSize,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.8,
+                ),
               ),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  Text(
-                    'REFUND AMOUNT',
-                    style: TextStyle(
-                      color: Colors.white38,
-                      fontSize: 9.5.fSize,
-                      fontWeight: FontWeight.bold,
-                      letterSpacing: 0.8,
-                    ),
-                  ),
-                  SizedBox(height: 2.h),
-                  Text(
-                    '₹${status.amount ?? order.totalAmount}',
-                    style: TextStyle(
-                      color: Colors.white,
-                      fontSize: 13.fSize,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ],
+              SizedBox(height: 2.h),
+              Text(
+                status.waitlistNumber,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: const Color(0xFFD8B26A),
+                  fontSize: 13.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              SizedBox(height: 8.h),
+              Text(
+                'REFUND AMOUNT',
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: 9.5.fSize,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.8,
+                ),
+              ),
+              SizedBox(height: 2.h),
+              Text(
+                '₹${status.amount ?? order.totalAmount}',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 13.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReorderRequestedBanner() {
+    return Container(
+      padding: EdgeInsets.all(14.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1E1A10),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 36.w,
+            height: 36.w,
+            decoration: BoxDecoration(
+              color: const Color(0xFFF59E0B).withValues(alpha: 0.15),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+              ),
+            ),
+            child: const Icon(
+              Icons.schedule_rounded,
+              color: Color(0xFFF59E0B),
+              size: 18,
+            ),
+          ),
+          SizedBox(width: 10.w),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Reorder Requested',
+                  style: TextStyle(
+                    color: const Color(0xFFF59E0B),
+                    fontSize: 13.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SizedBox(height: 3.h),
+                Text(
+                  'Your delivery reattempt request is in progress. Another delivery cannot be scheduled until this request is completed.',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 11.5.fSize,
+                    height: 1.3,
+                  ),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -1628,24 +1711,78 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   }
 
   Widget _buildActionButtons(UserOrder order) {
+    if (order.isReturnComplete) {
+      return const SizedBox.shrink();
+    }
     final isDeliveryReattempt = order.isDeliveryReattemptEligible;
     final isReturnPending = order.isReturnReattemptPending;
     final isReturnReattempt =
         !isReturnPending && order.isReturnFailed && !_isReturnSettled(order);
-    final opensReturn =
-        !isReturnReattempt && order.actionFlow == OrderActionFlow.delivered;
+    final isReturnApprovedPendingSchedule = !order.isReturnComplete &&
+        (order.returnStatus?.toUpperCase() == 'RETURN_APPROVED' ||
+            order.orderStatusRaw?.toUpperCase() == 'RETURN_APPROVED') &&
+        (order.pickupDate == null || order.pickupDate!.trim().isEmpty);
+    final opensReturn = !isReturnReattempt &&
+        (order.actionFlow == OrderActionFlow.delivered ||
+            order.canReturn ||
+            isReturnApprovedPendingSchedule);
     final opensTracking = !isDeliveryReattempt &&
         !isReturnReattempt &&
+        !isReturnApprovedPendingSchedule &&
         (order.actionFlow == OrderActionFlow.forward ||
             order.actionFlow == OrderActionFlow.reverse);
 
-    final showRefundButton = order.isRefundEligible && _refundStatus == null;
+    final inReturnFlow = order.isInReturnFlow ||
+        order.isReturnFailed ||
+        order.isReturnComplete ||
+        isReturnReattempt ||
+        isReturnPending ||
+        PendingReturnStore.instance.contains(order.id) ||
+        (order.returnStatus != null &&
+            order.returnStatus!.isNotEmpty &&
+            order.returnStatus!.toUpperCase() != 'ACTIVE' &&
+            order.returnStatus!.toUpperCase() != 'NOT_DELIVERED');
+
+    final showRefundButton =
+        !inReturnFlow && order.isRefundEligible && _refundStatus == null;
+    final refundInReview =
+        _refundStatus != null && !_refundStatus!.isRejected;
+    final primaryIsTracking = refundInReview ||
+        (!isDeliveryReattempt &&
+            !isReturnPending &&
+            !isReturnReattempt &&
+            !opensReturn &&
+            opensTracking);
+    final returnStatus = (order.returnStatus ?? '').trim().toUpperCase();
+    final orderStatus = (order.orderStatusRaw ?? '').trim().toUpperCase();
+    const returnRequestedStatuses = {
+      'RETURN_REQUESTED',
+      'RETURN_PENDING',
+      'PICKUP_SCHEDULED',
+      'WAITLISTED',
+      'RETURN_APPROVED',
+      'APPROVED',
+    };
+    final inReturnRequest = order.isInReturnFlow ||
+        isReturnPending ||
+        isReturnApprovedPendingSchedule ||
+        PendingReturnStore.instance.contains(order.id) ||
+        returnRequestedStatuses.contains(orderStatus) ||
+        returnRequestedStatuses.contains(returnStatus);
 
     String primaryButtonLabel;
     IconData primaryButtonIcon;
     VoidCallback? onPrimaryPressed;
 
-    if (isDeliveryReattempt) {
+    if (refundInReview) {
+      primaryButtonLabel = 'Refund Tracking';
+      primaryButtonIcon = Icons.near_me_outlined;
+      onPrimaryPressed = () => Navigator.pushNamed(
+            context,
+            AppRoutes.orderTrackingScreen,
+            arguments: order.id,
+          );
+    } else if (isDeliveryReattempt) {
       primaryButtonLabel = 'Schedule Delivery Reattempt';
       primaryButtonIcon = Icons.replay_rounded;
       onPrimaryPressed = _isReattemptActionLoading
@@ -1660,8 +1797,12 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       primaryButtonIcon = Icons.upgrade_rounded;
       onPrimaryPressed = () => _openReattemptPickupBottomSheet(order);
     } else if (opensReturn) {
-      primaryButtonLabel = 'Request Kit Return Pickup';
-      primaryButtonIcon = Icons.refresh_rounded;
+      primaryButtonLabel = isReturnApprovedPendingSchedule
+          ? 'Schedule Return Pickup'
+          : 'Request Kit Return Pickup';
+      primaryButtonIcon = isReturnApprovedPendingSchedule
+          ? Icons.calendar_today_outlined
+          : Icons.refresh_rounded;
       onPrimaryPressed = () => _openReturnOrder(order);
     } else if (opensTracking) {
       primaryButtonLabel = order.actionLabel;
@@ -1681,8 +1822,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       children: [
         SizedBox(
           height: 48.h,
-          width: double.infinity,
-          child: ElevatedButton.icon(
+        width: double.infinity,
+        child: ElevatedButton.icon(
             onPressed: onPrimaryPressed,
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFFD8B26A),
@@ -1705,6 +1846,38 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
             ),
           ),
         ),
+        if (isReturnReattempt || (inReturnRequest && !primaryIsTracking)) ...[
+          SizedBox(height: 12.h),
+          SizedBox(
+            height: 44.h,
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => Navigator.pushNamed(
+                context,
+                AppRoutes.orderTrackingScreen,
+                arguments: order.id,
+              ),
+              style: OutlinedButton.styleFrom(
+                side: BorderSide(
+                  color: const Color(0xFFD8B26A).withValues(alpha: 0.6),
+                ),
+                foregroundColor: const Color(0xFFD8B26A),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+              icon: const Icon(Icons.near_me_outlined, size: 17),
+              label: Text(
+                'Track Your Order',
+                style: TextStyle(
+                  fontSize: 12.5.fSize,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+          ),
+        ],
         if (showRefundButton) ...[
           SizedBox(height: 12.h),
           SizedBox(
@@ -1738,21 +1911,21 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   }
 
   Future<void> _openReturnOrder(UserOrder order) async {
-    final submitted = await Navigator.pushNamed(
-      context,
-      AppRoutes.returnOrderScreen,
+            final submitted = await Navigator.pushNamed(
+              context,
+              AppRoutes.returnOrderScreen,
       arguments: <String, dynamic>{
-        'orderId': order.id,
-        'orderNumber': order.orderIdDisplay,
-      },
-    );
-    if (submitted == true && mounted) {
-      await _loadOrder();
-      if (!mounted) return;
-      Navigator.pushNamed(
-        context,
-        AppRoutes.orderTrackingScreen,
-        arguments: order.id,
+                'orderId': order.id,
+                'orderNumber': order.orderIdDisplay,
+              },
+            );
+            if (submitted == true && mounted) {
+              await _loadOrder();
+              if (!mounted) return;
+              Navigator.pushNamed(
+                context,
+                AppRoutes.orderTrackingScreen,
+                arguments: order.id,
       );
     }
   }
@@ -1770,6 +1943,39 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     );
     if (submitted == true && mounted) {
       await _loadOrder();
+    }
+  }
+
+  Future<SavedAddress?> _addPickupAddress() async {
+    final location = await Navigator.pushNamed(
+      context,
+      AppRoutes.selectAddressScreen,
+    );
+    if (!mounted || location == null) return null;
+
+    final result = await Navigator.pushNamed(
+      context,
+      AppRoutes.addNewAddressScreen,
+      arguments: location is Map ? location : null,
+    );
+    if (!mounted || result is! Map) return null;
+
+    try {
+      final payload = result.map(
+        (key, value) => MapEntry(key.toString(), value?.toString() ?? ''),
+      );
+      return await createAndAppendSavedAddress(payload);
+    } on ApiException catch (error) {
+      if (mounted) CustomAppSnackBar.showError(context, error.message);
+      return null;
+    } catch (_) {
+      if (mounted) {
+        CustomAppSnackBar.showError(
+          context,
+          'Unable to save address. Please try again.',
+        );
+      }
+      return null;
     }
   }
 
@@ -1792,13 +1998,8 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       selectedAddressId = addresses.first.id;
     }
 
-    DateTime selectedDate = DateTime.now().add(const Duration(days: 1));
-    const returnSlots = [
-      '09:00 AM - 12:00 PM',
-      '12:00 PM - 03:00 PM',
-      '03:00 PM - 06:00 PM',
-    ];
-    String selectedSlot = returnSlots.first;
+    DateTime? selectedDate;
+    String? selectedSlot;
     final noteController = TextEditingController();
     bool isSubmitting = false;
 
@@ -1829,13 +2030,9 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
             );
 
             return Padding(
-              padding: EdgeInsets.fromLTRB(
-                20.w,
-                16.h,
-                20.w,
-                24.h + bottomPadding,
-              ),
+              padding: EdgeInsets.fromLTRB(20.w, 16.h, 20.w, 24.h),
               child: SingleChildScrollView(
+                padding: EdgeInsets.only(bottom: bottomPadding),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -2015,8 +2212,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                               ],
                             ),
                           ),
-                          if (addresses.length > 1) ...[
-                            TextButton(
+                          TextButton(
                               onPressed: () async {
                                 final pickedId = await showDialog<String>(
                                   context: modalContext,
@@ -2030,46 +2226,77 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                         fontWeight: FontWeight.bold,
                                       ),
                                     ),
-                                    children: addresses.map((addr) {
-                                      final isSelected =
-                                          addr.id == selectedAddressId;
-                                      return ListTile(
+                                    children: [
+                                      ...addresses.map((addr) {
+                                        final isSelected =
+                                            addr.id == selectedAddressId;
+                                        return ListTile(
+                                          title: Text(
+                                            addr.title,
+                                            style: TextStyle(
+                                              color: isSelected
+                                                  ? const Color(0xFFD8B26A)
+                                                  : Colors.white,
+                                              fontWeight: FontWeight.bold,
+                                              fontSize: 13.fSize,
+                                            ),
+                                          ),
+                                          subtitle: Text(
+                                            addr.addressLines,
+                                            style: TextStyle(
+                                              color: Colors.white60,
+                                              fontSize: 11.fSize,
+                                            ),
+                                            maxLines: 2,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          trailing: isSelected
+                                              ? const Icon(
+                                                  Icons.check_circle_rounded,
+                                                  color: Color(0xFFD8B26A),
+                                                  size: 20,
+                                                )
+                                              : null,
+                                          onTap: () =>
+                                              Navigator.pop(dialogCtx, addr.id),
+                                        );
+                                      }),
+                                      const Divider(color: Colors.white12),
+                                      ListTile(
+                                        leading: const Icon(
+                                          Icons.add_location_alt_outlined,
+                                          color: Color(0xFFD8B26A),
+                                        ),
                                         title: Text(
-                                          addr.title,
+                                          '+ Add New Address',
                                           style: TextStyle(
-                                            color: isSelected
-                                                ? const Color(0xFFD8B26A)
-                                                : Colors.white,
+                                            color: const Color(0xFFD8B26A),
                                             fontWeight: FontWeight.bold,
                                             fontSize: 13.fSize,
                                           ),
                                         ),
-                                        subtitle: Text(
-                                          addr.addressLines,
-                                          style: TextStyle(
-                                            color: Colors.white60,
-                                            fontSize: 11.fSize,
-                                          ),
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
+                                        onTap: () => Navigator.pop(
+                                          dialogCtx,
+                                          _addNewPickupAddressId,
                                         ),
-                                        trailing: isSelected
-                                            ? const Icon(
-                                                Icons.check_circle_rounded,
-                                                color: Color(0xFFD8B26A),
-                                                size: 20,
-                                              )
-                                            : null,
-                                        onTap: () =>
-                                            Navigator.pop(dialogCtx, addr.id),
-                                      );
-                                    }).toList(),
+                                      ),
+                                    ],
                                   ),
                                 );
-                                if (pickedId != null) {
-                                  setModalState(
-                                      () => selectedAddressId = pickedId);
+                                if (pickedId == null || !mounted) return;
+                                if (pickedId == _addNewPickupAddressId) {
+                                  final saved = await _addPickupAddress();
+                                  if (!mounted || saved == null) return;
+                                  setModalState(() {
+                                    addresses = List<SavedAddress>.from(
+                                      userSavedAddresses,
+                                    );
+                                    selectedAddressId = saved.id;
+                                  });
+                                  return;
                                 }
+                                setModalState(
+                                    () => selectedAddressId = pickedId);
                               },
                               child: Text(
                                 'Change',
@@ -2080,139 +2307,25 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                 ),
                               ),
                             ),
-                          ],
                         ],
                       ),
                     ),
                     SizedBox(height: 16.h),
 
-                    // Date Picker
-                    Text(
-                      'PICKUP DATE',
-                      style: TextStyle(
-                        color: const Color(0xFFD8B26A),
-                        fontSize: 11.fSize,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 1.0,
-                      ),
-                    ),
-                    SizedBox(height: 8.h),
-                    InkWell(
-                      onTap: () async {
-                        final picked = await showDatePicker(
-                          context: modalContext,
-                          initialDate: selectedDate,
-                          firstDate: DateTime.now(),
-                          lastDate: DateTime.now()
-                              .add(const Duration(days: 14)),
-                          builder: (context, child) {
-                            return Theme(
-                              data: ThemeData.dark().copyWith(
-                                colorScheme: const ColorScheme.dark(
-                                  primary: Color(0xFFD8B26A),
-                                  onPrimary: Colors.black,
-                                  surface: Color(0xFF1E2028),
-                                  onSurface: Colors.white,
-                                ),
-                              ),
-                              child: child!,
-                            );
-                          },
-                        );
-                        if (picked != null) {
-                          setModalState(() => selectedDate = picked);
-                        }
+                    _DeliveryReattemptScheduleFields(
+                      dateHeader: 'SELECT PICKUP DATE',
+                      timeHeader: 'SELECT PICKUP TIME',
+                      dateHint: 'Select Pickup Date',
+                      timeHint: 'Select Pickup Time',
+                      initialDate: selectedDate,
+                      initialTime: selectedSlot,
+                      allowToday: false,
+                      onChanged: (date, time) {
+                        setModalState(() {
+                          selectedDate = date;
+                          selectedSlot = time;
+                        });
                       },
-                      child: Container(
-                        padding: EdgeInsets.symmetric(
-                          horizontal: 14.w,
-                          vertical: 12.h,
-                        ),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF191B24),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: Colors.white.withValues(alpha: 0.1),
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                          children: [
-                            Row(
-                              children: [
-                                const Icon(
-                                  Icons.calendar_today_outlined,
-                                  color: Color(0xFFD8B26A),
-                                  size: 18,
-                                ),
-                                SizedBox(width: 10.w),
-                                Text(
-                                  '${selectedDate.day.toString().padLeft(2, '0')}/${selectedDate.month.toString().padLeft(2, '0')}/${selectedDate.year}',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 13.5.fSize,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            Text(
-                              'Change Date',
-                              style: TextStyle(
-                                color: const Color(0xFFD8B26A),
-                                fontSize: 12.fSize,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                    SizedBox(height: 16.h),
-
-                    // Time Slot Selector
-                    Text(
-                      'PICKUP TIME SLOT',
-                      style: TextStyle(
-                        color: const Color(0xFFD8B26A),
-                        fontSize: 11.fSize,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 1.0,
-                      ),
-                    ),
-                    SizedBox(height: 8.h),
-                    Wrap(
-                      spacing: 8.w,
-                      runSpacing: 8.h,
-                      children: returnSlots.map((slot) {
-                        final isSelected = slot == selectedSlot;
-                        return ChoiceChip(
-                          label: Text(
-                            slot,
-                            style: TextStyle(
-                              color: isSelected ? Colors.black : Colors.white70,
-                              fontSize: 11.5.fSize,
-                              fontWeight: isSelected
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                            ),
-                          ),
-                          selected: isSelected,
-                          selectedColor: const Color(0xFFD8B26A),
-                          backgroundColor: const Color(0xFF1A1D27),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            side: BorderSide(
-                              color: isSelected
-                                  ? const Color(0xFFD8B26A)
-                                  : Colors.white.withValues(alpha: 0.15),
-                            ),
-                          ),
-                          onSelected: (_) {
-                            setModalState(() => selectedSlot = slot);
-                          },
-                        );
-                      }).toList(),
                     ),
                     SizedBox(height: 16.h),
 
@@ -2258,6 +2371,15 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                         onPressed: isSubmitting
                             ? null
                             : () async {
+                                final date = selectedDate;
+                                final time = selectedSlot?.trim() ?? '';
+                                if (date == null || time.isEmpty) {
+                                  CustomAppSnackBar.showError(
+                                    sheetContext,
+                                    'Please select a pickup date and time.',
+                                  );
+                                  return;
+                                }
                                 setModalState(() => isSubmitting = true);
                                 try {
                                   Customer? customer;
@@ -2267,21 +2389,42 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                   } catch (_) {}
 
                                   final dateStr =
-                                      '${selectedDate.year}-${selectedDate.month.toString().padLeft(2, '0')}-${selectedDate.day.toString().padLeft(2, '0')}';
+                                      '${date.year.toString().padLeft(4, '0')}-'
+                                      '${date.month.toString().padLeft(2, '0')}-'
+                                      '${date.day.toString().padLeft(2, '0')}';
+                                  SavedAddress? pickedAddress;
+                                  for (final address in addresses) {
+                                    if (address.id == selectedAddressId) {
+                                      pickedAddress = address;
+                                      break;
+                                    }
+                                  }
+                                  final locationText =
+                                      pickedAddress?.addressLines.trim() ?? '';
+                                  final noteText = noteController.text.trim();
 
                                   final result =
                                       await _orderRepository.reattemptReturn(
                                     orderId: order.id,
                                     pickupDate: dateStr,
-                                    pickupTime: selectedSlot,
+                                    pickupTime: time,
                                     addressId: selectedAddressId,
-                                    note: noteController.text.trim(),
+                                    note: noteText,
                                     fullName: customer?.fullName ??
                                         order.pickupFullName ??
                                         'Customer',
                                     mobile: customer?.mobile ??
                                         order.pickupMobile ??
                                         '',
+                                  );
+
+                                  _rescheduledPickup = (
+                                    date: dateStr,
+                                    time: time,
+                                    location: locationText.isEmpty
+                                        ? pickedAddress?.title.trim()
+                                        : locationText,
+                                    note: noteText,
                                   );
 
                                   await PendingReturnStore.instance
@@ -2323,13 +2466,13 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                   CustomAppSnackBar.showError(
                                     context,
                                     'Failed to schedule return pickup. Please try again.',
-                                  );
-                                }
-                              },
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFFD8B26A),
-                          foregroundColor: Colors.black,
-                          shape: RoundedRectangleBorder(
+              );
+            }
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xFFD8B26A),
+            foregroundColor: Colors.black,
+            shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(10),
                           ),
                           elevation: 2,
@@ -2363,6 +2506,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   }
 
   Future<void> _startDeliveryReattemptFlow(UserOrder order) async {
+    if (order.isReorderRequested) return;
     setState(() => _isReattemptActionLoading = true);
     try {
       final quote = await _orderRepository.getReattemptQuote(order.id);
@@ -2387,14 +2531,15 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     UserOrder order,
     ReattemptQuote quote,
   ) async {
-    DateTime selectedDate = DateTime.now().add(const Duration(days: 1));
-    const slots = [
-      '10:00 AM - 01:00 PM',
-      '01:00 PM - 04:00 PM',
-      '04:00 PM - 07:00 PM',
-      '07:00 PM - 10:00 PM',
-    ];
-    String selectedSlot = slots.first;
+    DateTime? selectedDate;
+    String? selectedSlot;
+    final notesController = TextEditingController();
+    var notesDisposed = false;
+    void disposeNotes() {
+      if (notesDisposed) return;
+      notesDisposed = true;
+      notesController.dispose();
+    }
 
     await showModalBottomSheet<void>(
       context: context,
@@ -2404,22 +2549,16 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (sheetContext) {
-        return StatefulBuilder(
+        return _RunOnDispose(
+          action: disposeNotes,
+          child: StatefulBuilder(
           builder: (ctx, setSheetState) {
-            final y = selectedDate.year;
-            final m = selectedDate.month.toString().padLeft(2, '0');
-            final d = selectedDate.day.toString().padLeft(2, '0');
-            final apiDateStr = '$y-$m-$d';
-            final displayDateStr = '$d/$m/$y';
-
             return Padding(
-              padding: EdgeInsets.only(
-                left: 20.w,
-                right: 20.w,
-                top: 20.h,
-                bottom: MediaQuery.of(sheetContext).viewInsets.bottom + 20.h,
-              ),
+              padding: EdgeInsets.fromLTRB(20.w, 20.h, 20.w, 20.h),
               child: SingleChildScrollView(
+                padding: EdgeInsets.only(
+                  bottom: MediaQuery.of(sheetContext).viewInsets.bottom,
+                ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -2454,76 +2593,65 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                       ],
                     ),
                     SizedBox(height: 14.h),
+                    if (quote.isFreeReattempt) ...[
+                      Container(
+                        width: double.infinity,
+                        padding: EdgeInsets.symmetric(
+                          horizontal: 12.w,
+                          vertical: 10.h,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF10B981).withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: const Color(0xFF10B981).withValues(alpha: 0.45),
+                          ),
+                        ),
+                        child: Text(
+                          'Free Reattempt (Included with your Prime/Subscription membership)',
+                          style: TextStyle(
+                            color: const Color(0xFF10B981),
+                            fontSize: 12.5.fSize,
+                            fontWeight: FontWeight.w600,
+                            height: 1.35,
+                          ),
+                        ),
+                      ),
+                      SizedBox(height: 12.h),
+                    ],
                     Container(
                       padding: EdgeInsets.all(14.w),
                       decoration: BoxDecoration(
                         color: const Color(0xFF1A1D27),
-                        borderRadius: BorderRadius.circular(12),
+              borderRadius: BorderRadius.circular(12),
                         border: Border.all(
                           color: const Color(0xFFD8B26A).withValues(alpha: 0.35),
                         ),
                       ),
                       child: Column(
                         children: [
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              Text(
-                                'Delivery Charge',
-                                style: TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 12.5.fSize,
-                                ),
-                              ),
-                              Text(
-                                quote.isFreeReattempt || quote.deliveryCharge <= 0
-                                    ? 'FREE'
-                                    : '₹${quote.deliveryCharge}',
-                                style: TextStyle(
-                                  color: quote.isFreeReattempt ||
-                                          quote.deliveryCharge <= 0
-                                      ? const Color(0xFF10B981)
-                                      : Colors.white,
-                                  fontSize: 13.fSize,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
-                          ),
-                          if (quote.distanceKm > 0) ...[
-                            SizedBox(height: 8.h),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                Text(
-                                  'Delivery Distance',
-                                  style: TextStyle(
-                                    color: Colors.white70,
-                                    fontSize: 12.5.fSize,
-                                  ),
-                                ),
-                                Text(
-                                  '${quote.distanceKm} km',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 13.fSize,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              ],
+                          if (!quote.isFreeReattempt) ...[
+                            _reattemptChargeRow(
+                              'Reattempt Charge',
+                              _formatReattemptAmount(quote.reattemptCharge),
                             ),
+                            SizedBox(height: 8.h),
+                            _reattemptChargeRow(
+                              'Unpaid Previous Charges',
+                              _formatReattemptAmount(quote.unpaidPreviousCharges),
+                            ),
+                            SizedBox(height: 10.h),
+                            Divider(
+                              color: Colors.white.withValues(alpha: 0.1),
+                              height: 1,
+                            ),
+                            SizedBox(height: 10.h),
                           ],
-                          SizedBox(height: 10.h),
-                          Divider(
-                            color: Colors.white.withValues(alpha: 0.1),
-                            height: 1,
-                          ),
-                          SizedBox(height: 10.h),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               Text(
-                                'Total Payable',
+                                'Total Amount to Pay',
                                 style: TextStyle(
                                   color: const Color(0xFFD8B26A),
                                   fontSize: 13.5.fSize,
@@ -2531,11 +2659,11 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                                 ),
                               ),
                               Text(
-                                quote.totalPayable <= 0
-                                    ? 'FREE'
-                                    : '₹${quote.totalPayable}',
+                                quote.isFreeReattempt
+                                    ? '₹0'
+                                    : _formatReattemptAmount(quote.totalPayable),
                                 style: TextStyle(
-                                  color: quote.totalPayable <= 0
+                                  color: quote.isFreeReattempt
                                       ? const Color(0xFF10B981)
                                       : const Color(0xFFD8B26A),
                                   fontSize: 16.fSize,
@@ -2548,139 +2676,84 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                       ),
                     ),
                     SizedBox(height: 18.h),
-                    Text(
-                      'SELECT DELIVERY DATE',
-                      style: TextStyle(
-                        color: const Color(0xFFD8B26A),
-                        fontSize: 11.fSize,
-                        fontWeight: FontWeight.bold,
-                        letterSpacing: 1.0,
-                      ),
-                    ),
-                    SizedBox(height: 8.h),
-                    InkWell(
-                      onTap: () async {
-                        final picked = await showDatePicker(
-                          context: context,
-                          initialDate: selectedDate,
-                          firstDate: DateTime.now(),
-                          lastDate: DateTime.now().add(const Duration(days: 14)),
-                          builder: (context, child) {
-                            return Theme(
-                              data: Theme.of(context).copyWith(
-                                colorScheme: const ColorScheme.dark(
-                                  primary: Color(0xFFD8B26A),
-                                  onPrimary: Colors.black,
-                                  surface: Color(0xFF1A1D27),
-                                  onSurface: Colors.white,
-                                ),
-                              ),
-                              child: child!,
-                            );
-                          },
-                        );
-                        if (picked != null) {
-                          setSheetState(() => selectedDate = picked);
-                        }
+                    _DeliveryReattemptScheduleFields(
+                      onChanged: (date, time) {
+                        setSheetState(() {
+                          selectedDate = date;
+                          selectedSlot = time;
+                        });
                       },
-                      borderRadius: BorderRadius.circular(10),
-                      child: Container(
-                        padding:
-                            EdgeInsets.symmetric(horizontal: 14.w, vertical: 12.h),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF1A1D27),
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: const Color(0xFFD8B26A).withValues(alpha: 0.4),
-                          ),
-                        ),
-                        child: Row(
-                          children: [
-                            const Icon(
-                              Icons.calendar_today_rounded,
-                              color: Color(0xFFD8B26A),
-                              size: 18,
-                            ),
-                            SizedBox(width: 10.w),
-                            Text(
-                              displayDateStr,
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 13.5.fSize,
-                                fontWeight: FontWeight.w600,
-                              ),
-                            ),
-                            const Spacer(),
-                            Text(
-                              'Change',
-                              style: TextStyle(
-                                color: const Color(0xFFD8B26A),
-                                fontSize: 12.fSize,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
                     ),
-                    SizedBox(height: 18.h),
+                    SizedBox(height: 16.h),
                     Text(
-                      'SELECT DELIVERY TIME SLOT',
+                      'DELIVERY NOTES',
                       style: TextStyle(
-                        color: const Color(0xFFD8B26A),
-                        fontSize: 11.fSize,
+                        color: AppColours.primary,
+                        fontSize: 10.fSize,
                         fontWeight: FontWeight.bold,
-                        letterSpacing: 1.0,
+                        letterSpacing: 1.1,
                       ),
                     ),
                     SizedBox(height: 8.h),
-                    Wrap(
-                      spacing: 8.w,
-                      runSpacing: 8.h,
-                      children: slots.map((slot) {
-                        final isSelected = selectedSlot == slot;
-                        return ChoiceChip(
-                          label: Text(
-                            slot,
-                            style: TextStyle(
-                              color: isSelected ? Colors.black : Colors.white70,
-                              fontSize: 11.5.fSize,
-                              fontWeight: isSelected
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                            ),
+                    TextField(
+                      controller: notesController,
+                      maxLines: 2,
+                      style: TextStyle(color: Colors.white, fontSize: 13.fSize),
+                      decoration: InputDecoration(
+                        hintText: 'Optional delivery instructions',
+                        hintStyle: TextStyle(
+                          color: Colors.white38,
+                          fontSize: 12.fSize,
+                        ),
+                        filled: true,
+                        fillColor: const Color(0xFF16181D),
+                        contentPadding: EdgeInsets.symmetric(
+                          horizontal: 12.w,
+                          vertical: 12.h,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide(
+                            color: AppColours.primary.withValues(alpha: 0.6),
                           ),
-                          selected: isSelected,
-                          selectedColor: const Color(0xFFD8B26A),
-                          backgroundColor: const Color(0xFF1A1D27),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(8),
-                            side: BorderSide(
-                              color: isSelected
-                                  ? const Color(0xFFD8B26A)
-                                  : Colors.white12,
-                            ),
-                          ),
-                          onSelected: (val) {
-                            if (val) {
-                              setSheetState(() => selectedSlot = slot);
-                            }
-                          },
-                        );
-                      }).toList(),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide(color: AppColours.primary),
+                        ),
+                      ),
                     ),
                     SizedBox(height: 24.h),
                     SizedBox(
                       width: double.infinity,
                       height: 48.h,
                       child: ElevatedButton(
-                        onPressed: () {
+                        onPressed: () async {
+                          final date = selectedDate;
+                          final time = selectedSlot?.trim() ?? '';
+                          if (date == null || time.isEmpty) {
+                            CustomAppSnackBar.showError(
+                              sheetContext,
+                              'Please select a delivery date and time.',
+                            );
+                            return;
+                          }
+                          final apiDateStr =
+                              '${date.year.toString().padLeft(4, '0')}-'
+                              '${date.month.toString().padLeft(2, '0')}-'
+                              '${date.day.toString().padLeft(2, '0')}';
+                          final notes = notesController.text.trim();
+                          FocusManager.instance.primaryFocus?.unfocus();
+                          final sheetRoute = ModalRoute.of(sheetContext);
                           Navigator.pop(sheetContext);
-                          _submitDeliveryReorder(
+                          await _waitUntilRouteDismissed(sheetRoute);
+                          if (!mounted) return;
+                          await _submitDeliveryReorder(
                             order,
                             quote,
                             apiDateStr,
-                            selectedSlot,
+                            time,
+                            notes: notes,
                           );
                         },
                         style: ElevatedButton.styleFrom(
@@ -2688,18 +2761,18 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                           foregroundColor: Colors.black,
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(10),
-                          ),
-                          elevation: 2,
-                        ),
+            ),
+            elevation: 2,
+          ),
                         child: Text(
-                          quote.totalPayable > 0
-                              ? 'Pay ₹${quote.totalPayable} & Schedule'
-                              : 'Schedule Delivery Reattempt',
-                          style: TextStyle(
+                          quote.isFreeReattempt
+                              ? 'Schedule Delivery Reattempt'
+                              : 'Pay ${_formatReattemptAmount(quote.totalPayable)} & Schedule',
+            style: TextStyle(
                             fontSize: 13.5.fSize,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 0.5,
-                          ),
+              fontWeight: FontWeight.bold,
+              letterSpacing: 0.5,
+            ),
                         ),
                       ),
                     ),
@@ -2708,101 +2781,446 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
               ),
             );
           },
+          ),
         );
       },
     );
+  }
+
+  Future<void> _waitUntilRouteDismissed(ModalRoute<dynamic>? route) async {
+    final animation = route?.animation;
+    if (animation == null || animation.status == AnimationStatus.dismissed) {
+      return;
+    }
+    final completer = Completer<void>();
+    void listener(AnimationStatus status) {
+      if (status == AnimationStatus.dismissed && !completer.isCompleted) {
+        animation.removeStatusListener(listener);
+        completer.complete();
+      }
+    }
+
+    animation.addStatusListener(listener);
+    if (animation.status == AnimationStatus.dismissed) {
+      animation.removeStatusListener(listener);
+      return;
+    }
+    await completer.future;
+  }
+
+  String _formatReattemptAmount(num value) {
+    if (value == value.roundToDouble()) return '₹${value.toInt()}';
+    return '₹${value.toStringAsFixed(2)}';
+  }
+
+  Widget _reattemptChargeRow(String label, String value) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(
+          label,
+          style: TextStyle(
+            color: Colors.white70,
+            fontSize: 12.5.fSize,
+          ),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: 13.fSize,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  void _showReattemptLoader() {
+    if (!mounted || _reattemptLoaderVisible) return;
+    _reattemptLoaderVisible = true;
+    final view = ValueNotifier<_ReattemptDialogView>(
+      const _ReattemptDialogView.loading(),
+    );
+    final closed = Completer<void>();
+    _reattemptDialogView = view;
+    _reattemptDialogClosed = closed;
+    showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      barrierColor: Colors.black.withValues(alpha: 0.72),
+      builder: (dialogContext) {
+        return ValueListenableBuilder<_ReattemptDialogView>(
+          valueListenable: view,
+          builder: (context, model, _) {
+            if (model.loading) {
+              return const _ReattemptLoadingDialog();
+            }
+            return _buildReattemptSuccessCard(
+              message: model.message,
+              deliveryDate: model.deliveryDate,
+              deliveryTime: model.deliveryTime,
+              onOk: () => Navigator.of(dialogContext).pop(),
+            );
+          },
+        );
+      },
+    ).whenComplete(() {
+      _reattemptLoaderVisible = false;
+      if (identical(_reattemptDialogView, view)) {
+        _reattemptDialogView = null;
+      }
+      if (identical(_reattemptDialogClosed, closed)) {
+        _reattemptDialogClosed = null;
+      }
+      view.dispose();
+      if (!closed.isCompleted) closed.complete();
+    });
+  }
+
+  void _showReattemptResult({
+    required String message,
+    required String deliveryDate,
+    required String deliveryTime,
+  }) {
+    final view = _reattemptDialogView;
+    if (view == null) return;
+    view.value = _ReattemptDialogView.success(
+      message: message.trim().isEmpty
+          ? 'Successfully joined waitlist'
+          : message.trim(),
+      deliveryDate: deliveryDate,
+      deliveryTime: deliveryTime,
+    );
+  }
+
+  Future<void> _closeReattemptDialog() async {
+    final closed = _reattemptDialogClosed;
+    if (_reattemptLoaderVisible && mounted) {
+      final navigator = Navigator.of(context, rootNavigator: true);
+      if (navigator.canPop()) {
+        navigator.pop();
+      }
+    }
+    if (closed != null) {
+      await closed.future;
+    }
   }
 
   Future<void> _submitDeliveryReorder(
     UserOrder order,
     ReattemptQuote quote,
     String deliveryDate,
-    String deliveryTime,
-  ) async {
+    String deliveryTime, {
+    String? notes,
+  }) async {
     setState(() => _isReattemptActionLoading = true);
+    _showReattemptLoader();
 
     try {
-      final res = await _orderRepository.reorderDelivery(
+      if (quote.isFreeReattempt) {
+        final message = await _orderRepository.submitReorderRequest(
+          orderId: order.id,
+          deliveryDate: deliveryDate,
+          deliveryTime: deliveryTime,
+          notes: notes,
+        );
+        if (!mounted) return;
+        setState(() => _isReattemptActionLoading = false);
+        _showReattemptResult(
+          message: message,
+          deliveryDate: deliveryDate,
+          deliveryTime: deliveryTime,
+        );
+        await _reattemptDialogClosed?.future;
+        if (!mounted) return;
+        await _loadOrder();
+        return;
+      }
+
+      final setup = await _orderRepository.reorderDelivery(
         orderId: order.id,
         deliveryDate: deliveryDate,
         deliveryTime: deliveryTime,
       );
 
-      if (res.paymentRequired) {
-        _pendingReattemptOrderId = order.id;
-        _pendingReattemptDeliveryDate = deliveryDate;
-        _pendingReattemptDeliveryTime = deliveryTime;
-
-        Customer? customer;
-        try {
-          customer = await _profileRepository.getProfile();
-        } catch (_) {}
-
-        final keyId = res.razorpayKeyId ?? 'rzp_test_51O2aL2a';
-        final amountPaise = res.amount > 0
-            ? res.amount
-            : (quote.totalPayable * 100).round();
-
-        _razorpayService.openCheckout(
-          keyId: keyId,
-          orderId: res.razorpayOrderId ?? '',
-          amount: amountPaise,
-          currency: res.currency,
-          name: customer?.fullName,
-          email: customer?.email,
-          contact: customer?.mobile,
-          description: 'Delivery reattempt for Order #${order.orderIdDisplay}',
-        );
-      } else {
+      final razorpayOrderId = setup.razorpayOrderId?.trim() ?? '';
+      final keyId = setup.razorpayKeyId?.trim() ?? '';
+      if (!setup.paymentRequired || razorpayOrderId.isEmpty || keyId.isEmpty) {
         if (!mounted) return;
         setState(() => _isReattemptActionLoading = false);
-
-        await showDialog<void>(
-          context: context,
-          builder: (ctx) => AlertDialog(
-            backgroundColor: const Color(0xFF16181D),
-            title: Row(
-              children: [
-                const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981)),
-                const SizedBox(width: 8),
-                Text(
-                  'Reattempt Scheduled',
-                  style: TextStyle(
-                    color: AppColours.primary,
-                    fontSize: 16.fSize,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-            content: Text(
-              res.message ??
-                  'Your delivery reattempt has been scheduled for $deliveryDate ($deliveryTime).',
-              style: TextStyle(color: Colors.white70, fontSize: 14.fSize),
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx),
-                child: Text('OK', style: TextStyle(color: AppColours.primary)),
-              ),
-            ],
-          ),
+        _showReattemptResult(
+          message: setup.message ??
+              'Your delivery reattempt has been scheduled for $deliveryDate ($deliveryTime).',
+          deliveryDate: deliveryDate,
+          deliveryTime: deliveryTime,
         );
-
-        await _loadOrder();
+        await _reattemptDialogClosed?.future;
+        if (!mounted) return;
+        if (!mounted) return;
+        Navigator.pushNamed(
+          context,
+          AppRoutes.orderTrackingScreen,
+          arguments: order.id,
+        );
+        return;
       }
-    } on ApiException catch (e) {
+
+      _pendingReattemptOrderId = order.id;
+      _pendingReattemptDeliveryDate = deliveryDate;
+      _pendingReattemptDeliveryTime = deliveryTime;
+
+      Customer? customer;
+      try {
+        customer = await _profileRepository.getProfile();
+      } catch (_) {}
+
+      final payablePaise = (quote.totalPayable * 100).round();
+      final amountPaise =
+          setup.amount >= payablePaise ? setup.amount : payablePaise;
+
+      if (mounted) setState(() => _isReattemptActionLoading = false);
+      await _closeReattemptDialog();
       if (!mounted) return;
-      setState(() => _isReattemptActionLoading = false);
+      _razorpayService.openCheckout(
+        keyId: keyId,
+        orderId: razorpayOrderId,
+        amount: amountPaise,
+        currency: setup.currency,
+        name: customer?.fullName,
+        email: customer?.email,
+        contact: customer?.mobile,
+        description: 'Delivery reattempt for Order #${order.orderIdDisplay}',
+      );
+    } on ApiException catch (e) {
+      if (mounted) setState(() => _isReattemptActionLoading = false);
+      await _closeReattemptDialog();
+      if (!mounted) return;
       CustomAppSnackBar.showError(context, e.message);
     } catch (_) {
+      if (mounted) setState(() => _isReattemptActionLoading = false);
+      await _closeReattemptDialog();
       if (!mounted) return;
-      setState(() => _isReattemptActionLoading = false);
       CustomAppSnackBar.showError(
         context,
         'Failed to schedule delivery reattempt. Please try again.',
       );
     }
+  }
+
+  String _formatReattemptDateLabel(String raw) {
+    final parts = raw.trim().split('-');
+    if (parts.length != 3) return raw;
+    const months = [
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
+    ];
+    final year = int.tryParse(parts[0]);
+    final month = int.tryParse(parts[1]);
+    final day = int.tryParse(parts[2]);
+    if (year == null ||
+        month == null ||
+        day == null ||
+        month < 1 ||
+        month > 12) {
+      return raw;
+    }
+    return '${day.toString().padLeft(2, '0')} ${months[month - 1]} $year';
+  }
+
+  Future<void> _showReattemptScheduledDialog(
+    String message, {
+    String? deliveryDate,
+    String? deliveryTime,
+  }) {
+    final date = deliveryDate?.trim() ?? '';
+    final time = deliveryTime?.trim() ?? '';
+    final text = message.trim().isEmpty
+        ? 'Successfully joined waitlist'
+        : message.trim();
+
+    return showDialog<void>(
+      context: context,
+      useRootNavigator: true,
+      barrierDismissible: false,
+      builder: (ctx) => _buildReattemptSuccessCard(
+        message: text,
+        deliveryDate: date,
+        deliveryTime: time,
+        onOk: () => Navigator.of(ctx).pop(),
+      ),
+    );
+  }
+
+  Widget _buildReattemptSuccessCard({
+    required String message,
+    required String deliveryDate,
+    required String deliveryTime,
+    required VoidCallback onOk,
+  }) {
+    final date = deliveryDate.trim();
+    final time = deliveryTime.trim();
+    return Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: EdgeInsets.symmetric(horizontal: 24.w),
+        child: Container(
+          padding: EdgeInsets.fromLTRB(18.w, 22.h, 18.w, 16.h),
+          decoration: BoxDecoration(
+            color: const Color(0xFF16181D),
+            borderRadius: BorderRadius.circular(18),
+            border: Border.all(
+              color: const Color(0xFF10B981).withValues(alpha: 0.35),
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 64.w,
+                height: 64.w,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF10B981).withValues(alpha: 0.14),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  Icons.check_circle_rounded,
+                  color: const Color(0xFF10B981),
+                  size: 36.fSize,
+                ),
+              ),
+              SizedBox(height: 14.h),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16.fSize,
+                  fontWeight: FontWeight.bold,
+                  height: 1.3,
+                ),
+              ),
+              if (date.isNotEmpty || time.isNotEmpty) ...[
+                SizedBox(height: 16.h),
+                Container(
+                  width: double.infinity,
+                  padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 12.h),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF12141C),
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(
+                      color: const Color(0xFFD8B26A).withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: Column(
+                    children: [
+                      if (date.isNotEmpty)
+                        _reattemptSuccessRow(
+                          icon: Icons.calendar_month_rounded,
+                          label: 'Delivery Date',
+                          value: _formatReattemptDateLabel(date),
+                        ),
+                      if (date.isNotEmpty && time.isNotEmpty)
+                        Padding(
+                          padding: EdgeInsets.symmetric(vertical: 10.h),
+                          child: Divider(
+                            color: Colors.white.withValues(alpha: 0.08),
+                            height: 1,
+                          ),
+                        ),
+                      if (time.isNotEmpty)
+                        _reattemptSuccessRow(
+                          icon: Icons.schedule_rounded,
+                          label: 'Delivery Time',
+                          value: time,
+                        ),
+                    ],
+                  ),
+                ),
+              ],
+              SizedBox(height: 18.h),
+              SizedBox(
+                width: double.infinity,
+                height: 44.h,
+                child: ElevatedButton(
+                  onPressed: onOk,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: const Color(0xFFD8B26A),
+          foregroundColor: Colors.black,
+                    elevation: 0,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+          ),
+        ),
+                  child: Text(
+                    'OK',
+          style: TextStyle(
+                      fontSize: 14.fSize,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+    );
+  }
+
+  Widget _reattemptSuccessRow({
+    required IconData icon,
+    required String label,
+    required String value,
+  }) {
+    return Row(
+      children: [
+        Container(
+          width: 36.w,
+          height: 36.w,
+          decoration: BoxDecoration(
+            color: const Color(0xFFD8B26A).withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Icon(icon, color: const Color(0xFFD8B26A), size: 18),
+        ),
+        SizedBox(width: 12.w),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label.toUpperCase(),
+                style: TextStyle(
+                  color: Colors.white38,
+                  fontSize: 9.5.fSize,
+                  fontWeight: FontWeight.bold,
+                  letterSpacing: 0.7,
+                ),
+              ),
+              SizedBox(height: 2.h),
+              Text(
+                value,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
   }
 
   Future<void> _onRazorpayPaymentSuccess(
@@ -2831,39 +3249,18 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
       if (!mounted) return;
       setState(() => _isReattemptActionLoading = false);
 
-      await showDialog<void>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          backgroundColor: const Color(0xFF16181D),
-          title: Row(
-            children: [
-              const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981)),
-              const SizedBox(width: 8),
-              Text(
-                'Payment Confirmed',
-                style: TextStyle(
-                  color: AppColours.primary,
-                  fontSize: 16.fSize,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          content: Text(
-            res.message ??
-                'Payment verified! Delivery reattempt has been scheduled successfully.',
-            style: TextStyle(color: Colors.white70, fontSize: 14.fSize),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: Text('OK', style: TextStyle(color: AppColours.primary)),
-            ),
-          ],
-        ),
+      await _showReattemptScheduledDialog(
+        res.message ??
+            'Payment verified! Delivery reattempt has been scheduled successfully.',
+        deliveryDate: date,
+        deliveryTime: time,
       );
-
-      await _loadOrder();
+      if (!mounted) return;
+      Navigator.pushNamed(
+        context,
+        AppRoutes.orderTrackingScreen,
+        arguments: orderId,
+      );
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _isReattemptActionLoading = false);
@@ -2914,14 +3311,11 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
             return Padding(
-              padding: EdgeInsets.only(
-                left: 20.w,
-                right: 20.w,
-                top: 20.h,
-                bottom:
-                    MediaQuery.of(bottomSheetContext).viewInsets.bottom + 20.h,
-              ),
+              padding: EdgeInsets.fromLTRB(20.w, 20.h, 20.w, 20.h),
               child: SingleChildScrollView(
+                padding: EdgeInsets.only(
+                  bottom: MediaQuery.of(bottomSheetContext).viewInsets.bottom,
+                ),
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -3036,7 +3430,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                           dropdownColor: const Color(0xFF1E222D),
                           style: TextStyle(
                             color: Colors.white,
-                            fontSize: 13.fSize,
+            fontSize: 13.fSize,
                           ),
                           items: reasons
                               .map(
@@ -3060,7 +3454,7 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                       style: TextStyle(
                         color: const Color(0xFFD8B26A),
                         fontSize: 11.fSize,
-                        fontWeight: FontWeight.bold,
+            fontWeight: FontWeight.bold,
                         letterSpacing: 1.0,
                       ),
                     ),
@@ -3220,8 +3614,19 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
   Widget _buildAmountPaidSummaryCard(UserOrder order) {
     final items = order.lineItems ?? [];
     final kidsItems = items.where(_isItemKids).toList();
-    final subItems = items.where((it) => !_isItemKids(it) && _isItemSubscription(it, order)).toList();
-    final nonSubItems = items.where((it) => !_isItemKids(it) && !_isItemSubscription(it, order)).toList();
+    final essentialItems = items.where(_isItemEssentials).toList();
+    final subItems = items
+        .where((it) =>
+            !_isItemKids(it) &&
+            !_isItemEssentials(it) &&
+            _isItemSubscription(it, order))
+        .toList();
+    final nonSubItems = items
+        .where((it) =>
+            !_isItemKids(it) &&
+            !_isItemEssentials(it) &&
+            !_isItemSubscription(it, order))
+        .toList();
     final isSub = order.orderType?.trim().toUpperCase() == 'SUBSCRIPTION' ||
         order.title.toLowerCase().contains('subscription');
     final garmentCount = items.isNotEmpty
@@ -3230,6 +3635,27 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
     final subCount = subItems.fold<int>(0, (s, i) => s + (i.quantity > 0 ? i.quantity : 1));
     final nonSubCount = nonSubItems.fold<int>(0, (s, i) => s + (i.quantity > 0 ? i.quantity : 1));
     final kidsCount = kidsItems.fold<int>(0, (s, i) => s + (i.quantity > 0 ? i.quantity : 1));
+    final essentialsCount =
+        essentialItems.fold<int>(0, (s, i) => s + (i.quantity > 0 ? i.quantity : 1));
+    num lineAmount(List<OrderLineItem> lines) {
+      return lines.fold<num>(
+        0,
+        (sum, item) =>
+            sum + (item.lineTotal > 0 ? item.lineTotal : (item.unitPrice * item.quantity)),
+      );
+    }
+
+    final kidsAmount = lineAmount(kidsItems);
+    final essentialsAmount = lineAmount(essentialItems);
+    num kitOnlyAmount = order.kitPrice;
+    if (kitOnlyAmount <= 0) {
+      final extras = kidsAmount + essentialsAmount;
+      if (order.subtotal > extras) {
+        kitOnlyAmount = order.subtotal - extras;
+      } else {
+        kitOnlyAmount = lineAmount(nonSubItems);
+      }
+    }
 
     return Container(
       padding: EdgeInsets.all(16.w),
@@ -3412,17 +3838,25 @@ class _OrderDetailsScreenState extends State<OrderDetailsScreen> {
                 if (nonSubItems.isNotEmpty)
                   _billingSummaryRow(
                     'Non-Subscription Garments ($nonSubCount ${nonSubCount == 1 ? 'item' : 'items'})',
-                    _formatCurrency(order.subtotal > 0 ? order.subtotal : order.kitPrice),
+                    _formatCurrency(kitOnlyAmount),
                   ),
                 if (kidsItems.isNotEmpty)
                   _billingSummaryRow(
                     'Kids Collection ($kidsCount ${kidsCount == 1 ? 'item' : 'items'})',
-                    _formatCurrency(kidsItems.fold<num>(0, (sum, i) => sum + (i.lineTotal > 0 ? i.lineTotal : (i.unitPrice * i.quantity)))),
+                    _formatCurrency(kidsAmount),
                   ),
-                if (subItems.isEmpty && nonSubItems.isEmpty && kidsItems.isEmpty)
+                if (essentialItems.isNotEmpty)
+                  _billingSummaryRow(
+                    'Essentials ($essentialsCount ${essentialsCount == 1 ? 'item' : 'items'})',
+                    _formatCurrency(essentialsAmount),
+                  ),
+                if (subItems.isEmpty &&
+                    nonSubItems.isEmpty &&
+                    kidsItems.isEmpty &&
+                    essentialItems.isEmpty)
                   _billingSummaryRow(
                     'Kit Garments ($garmentCount ${garmentCount == 1 ? 'item' : 'items'})',
-                    _formatCurrency(order.subtotal > 0 ? order.subtotal : order.kitPrice),
+                    _formatCurrency(kitOnlyAmount),
                   ),
                 _billingSummaryRow(
                   'Delivery Fee',
@@ -3804,12 +4238,18 @@ class _SummaryCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final statusText = (order.isInReturnFlow
+    final isReturnComplete = order.isReturnComplete;
+    final rawStatus = isReturnComplete
+        ? 'COMPLETED'
+        : (order.isReorderRequested
+            ? 'REORDER_REQUESTED'
+            : (order.isInReturnFlow
             ? (order.orderStatusRaw ?? 'PICKUP SCHEDULED')
             : (order.orderStatusRaw ??
-                (order.isDelivered ? 'DELIVERED' : 'CONFIRMED')))
-        .replaceAll('_', ' ')
-        .toUpperCase();
+                    (order.isDelivered ? 'DELIVERED' : 'CONFIRMED'))));
+    final statusText = isReturnComplete
+        ? 'COMPLETED'
+        : rawStatus.replaceAll('_', ' ').toUpperCase();
 
     return Container(
       padding: EdgeInsets.all(12.w),
@@ -3884,23 +4324,40 @@ class _SummaryCard extends StatelessWidget {
                   ),
                 ),
                 SizedBox(height: 8.h),
-                Container(
-                  padding:
-                      EdgeInsets.symmetric(horizontal: 10.w, vertical: 3.h),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: FittedBox(
+                    fit: BoxFit.scaleDown,
+                    alignment: Alignment.centerLeft,
+                    child: Container(
+                      padding: EdgeInsets.symmetric(
+                        horizontal: 10.w,
+                        vertical: 3.h,
+                      ),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1B160C),
+                        color: isReturnComplete
+                            ? const Color(0xFF0D2818)
+                            : const Color(0xFF1B160C),
                     borderRadius: BorderRadius.circular(20),
                     border: Border.all(
-                      color: const Color(0xFFD8B26A).withValues(alpha: 0.5),
+                          color: isReturnComplete
+                              ? const Color(0xFF34D399).withValues(alpha: 0.6)
+                              : const Color(0xFFD8B26A).withValues(alpha: 0.5),
                     ),
                   ),
                   child: Text(
                     'ORDER STATUS : $statusText',
+                        maxLines: 1,
+                        softWrap: false,
                     style: TextStyle(
-                      color: const Color(0xFFE6C27A),
+                          color: isReturnComplete
+                              ? const Color(0xFF34D399)
+                              : const Color(0xFFE6C27A),
                       fontSize: 10.fSize,
                       fontWeight: FontWeight.bold,
-                      letterSpacing: 0.5,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
                     ),
                   ),
                 ),
@@ -4456,6 +4913,697 @@ class _RateProductBox extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ReattemptLoadingDialog extends StatefulWidget {
+  const _ReattemptLoadingDialog();
+
+  @override
+  State<_ReattemptLoadingDialog> createState() =>
+      _ReattemptLoadingDialogState();
+}
+
+class _ReattemptLoadingDialogState extends State<_ReattemptLoadingDialog>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+        child: Material(
+          color: Colors.transparent,
+          child: Container(
+            width: 230.w,
+            padding: EdgeInsets.symmetric(horizontal: 20.w, vertical: 24.h),
+            decoration: BoxDecoration(
+              color: const Color(0xFF16181D),
+              borderRadius: BorderRadius.circular(18),
+              border: Border.all(
+                color: const Color(0xFFD8B26A).withValues(alpha: 0.7),
+              ),
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                SizedBox(
+                  width: 72.w,
+                  height: 72.w,
+                  child: AnimatedBuilder(
+                    animation: _controller,
+                    builder: (context, child) {
+                      final pulse = 0.9 +
+                          (0.1 *
+                              (1 - ((_controller.value - 0.5).abs() * 2)));
+                      return Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          SizedBox(
+                            width: 72.w,
+                            height: 72.w,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 3,
+                              color: const Color(0xFFD8B26A),
+                              backgroundColor: const Color(0xFFD8B26A)
+                                  .withValues(alpha: 0.18),
+                            ),
+                          ),
+                          Transform.scale(scale: pulse, child: child),
+                        ],
+                      );
+                    },
+                    child: Icon(
+                      Icons.local_shipping_rounded,
+                      color: const Color(0xFFD8B26A),
+                      size: 28.w,
+                    ),
+                  ),
+                ),
+                SizedBox(height: 16.h),
+                Text(
+                  'Scheduling delivery',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: const Color(0xFFD8B26A),
+                    fontSize: 15.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SizedBox(height: 6.h),
+                Text(
+                  'Please wait while we confirm your reattempt.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12.fSize,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+    );
+  }
+}
+
+class _ReattemptDialogView {
+  const _ReattemptDialogView.loading()
+      : loading = true,
+        message = '',
+        deliveryDate = '',
+        deliveryTime = '';
+
+  const _ReattemptDialogView.success({
+    required this.message,
+    required this.deliveryDate,
+    required this.deliveryTime,
+  }) : loading = false;
+
+  final bool loading;
+  final String message;
+  final String deliveryDate;
+  final String deliveryTime;
+}
+
+class _RunOnDispose extends StatefulWidget {
+  const _RunOnDispose({required this.action, required this.child});
+
+  final VoidCallback action;
+  final Widget child;
+
+  @override
+  State<_RunOnDispose> createState() => _RunOnDisposeState();
+}
+
+class _RunOnDisposeState extends State<_RunOnDispose> {
+  @override
+  void dispose() {
+    final action = widget.action;
+    WidgetsBinding.instance.addPostFrameCallback((_) => action());
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
+}
+
+class _DeliveryReattemptScheduleFields extends StatefulWidget {
+  const _DeliveryReattemptScheduleFields({
+    super.key,
+    required this.onChanged,
+    this.dateHeader = 'SELECT DELIVERY DATE',
+    this.timeHeader = 'SELECT DELIVERY TIME',
+    this.dateHint = 'Select Delivery Date',
+    this.timeHint = 'Select Delivery Time',
+    this.initialDate,
+    this.initialTime,
+    this.allowToday = false,
+  });
+
+  final void Function(DateTime? date, String? time) onChanged;
+  final String dateHeader;
+  final String timeHeader;
+  final String dateHint;
+  final String timeHint;
+  final DateTime? initialDate;
+  final String? initialTime;
+  final bool allowToday;
+
+  @override
+  State<_DeliveryReattemptScheduleFields> createState() =>
+      _DeliveryReattemptScheduleFieldsState();
+}
+
+class _DeliveryReattemptScheduleFieldsState
+    extends State<_DeliveryReattemptScheduleFields> {
+  DateTime? _selectedDeliveryDate;
+  late DateTime _calendarMonth;
+  bool _showCalendar = false;
+  bool _showTimePicker = false;
+  int _selectedHour = 12;
+  int _selectedMinute = 40;
+  bool _isAM = false;
+  String? _selectedTimeLabel;
+  late final FixedExtentScrollController _hourController;
+  late final FixedExtentScrollController _minuteController;
+  late final FixedExtentScrollController _periodController;
+
+  DateTime get _todayDateOnly {
+    final now = DateTime.now();
+    return DateTime(now.year, now.month, now.day);
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _selectedDeliveryDate = widget.initialDate;
+    _selectedTimeLabel = widget.initialTime;
+    if (_selectedTimeLabel != null) {
+      _parseInitialTime(_selectedTimeLabel!);
+    }
+    final now = DateTime.now();
+    _calendarMonth = _selectedDeliveryDate != null
+        ? DateTime(_selectedDeliveryDate!.year, _selectedDeliveryDate!.month, 1)
+        : DateTime(now.year, now.month, 1);
+    _hourController = FixedExtentScrollController(initialItem: _selectedHour - 1);
+    _minuteController = FixedExtentScrollController(initialItem: _selectedMinute);
+    _periodController = FixedExtentScrollController(initialItem: _isAM ? 1 : 0);
+  }
+
+  void _parseInitialTime(String time) {
+    final match = RegExp(r'^(\d{1,2}):(\d{2})\s*(AM|PM)$', caseSensitive: false)
+        .firstMatch(time.trim());
+    if (match != null) {
+      final h = int.tryParse(match.group(1)!) ?? 12;
+      final m = int.tryParse(match.group(2)!) ?? 0;
+      final p = match.group(3)!.toUpperCase();
+      _selectedHour = (h >= 1 && h <= 12) ? h : 12;
+      _selectedMinute = (m >= 0 && m <= 59) ? m : 0;
+      _isAM = p == 'AM';
+    }
+  }
+
+  @override
+  void dispose() {
+    _hourController.dispose();
+    _minuteController.dispose();
+    _periodController.dispose();
+    super.dispose();
+  }
+
+  void _notify() {
+    widget.onChanged(_selectedDeliveryDate, _selectedTimeLabel);
+  }
+
+  String _formatDate(DateTime d) {
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+    ];
+    return '${d.day.toString().padLeft(2, '0')} ${months[d.month - 1]} ${d.year}';
+  }
+
+  String _monthYearLabel(DateTime m) {
+    const months = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+    return '${months[m.month - 1]} ${m.year}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.dateHeader,
+                    style: TextStyle(
+                      color: AppColours.primary,
+                      fontSize: 10.fSize,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.1,
+                    ),
+                  ),
+                  SizedBox(height: 12.h),
+                  _buildDeliveryDateField(),
+                ],
+              ),
+            ),
+            SizedBox(width: 12.w),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    widget.timeHeader,
+                    style: TextStyle(
+                      color: AppColours.primary,
+                      fontSize: 10.fSize,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.1,
+                    ),
+                  ),
+                  SizedBox(height: 12.h),
+                  _buildDeliveryTimeField(),
+                ],
+              ),
+            ),
+          ],
+        ),
+        if (_showCalendar) ...[
+          SizedBox(height: 10.h),
+          _buildInlineCalendar(),
+        ],
+        if (_showTimePicker) ...[
+          SizedBox(height: 8.h),
+          _buildInlineTimePicker(),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildDeliveryDateField() {
+    return GestureDetector(
+      onTap: () => setState(() {
+        _showCalendar = !_showCalendar;
+        if (_showCalendar) _showTimePicker = false;
+      }),
+      child: Container(
+        height: 50.h,
+        padding: EdgeInsets.symmetric(horizontal: 12.w),
+        decoration: BoxDecoration(
+          color: const Color(0xFF16181D),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColours.primary, width: 0.6),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                _selectedDeliveryDate != null
+                    ? _formatDate(_selectedDeliveryDate!)
+                    : widget.dateHint,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: _selectedDeliveryDate != null
+                      ? Colors.white
+                      : AppColours.hintcolor,
+                  fontSize: 12.fSize,
+                ),
+              ),
+            ),
+            Icon(
+              Icons.calendar_today_outlined,
+              color: AppColours.primary,
+              size: 16,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeliveryTimeField() {
+    return GestureDetector(
+      onTap: () => setState(() {
+        _showTimePicker = !_showTimePicker;
+        if (_showTimePicker) _showCalendar = false;
+      }),
+      child: Container(
+        height: 50.h,
+        padding: EdgeInsets.symmetric(horizontal: 12.w),
+        decoration: BoxDecoration(
+          color: const Color(0xFF16181D),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: AppColours.primary, width: 0.6),
+        ),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                _selectedTimeLabel ?? widget.timeHint,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: _selectedTimeLabel != null
+                      ? Colors.white
+                      : AppColours.hintcolor,
+                  fontSize: 12.fSize,
+                ),
+              ),
+            ),
+            SizedBox(
+              width: 16.w,
+              height: 16.w,
+              child: Transform.rotate(
+                angle: _showTimePicker ? 0 : pi,
+                child: SvgPicture.asset(
+                  IconConstant.dropDown1,
+                  width: 16.w,
+                  height: 16.w,
+                  fit: BoxFit.contain,
+                  colorFilter: ColorFilter.mode(
+                    AppColours.primary,
+                    BlendMode.srcIn,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildInlineTimePicker() {
+    return Container(
+      padding: EdgeInsets.symmetric(vertical: 12.h, horizontal: 12.w),
+      decoration: BoxDecoration(
+        color: const Color(0xFF16181D),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColours.primary.withOpacity(0.5)),
+      ),
+      child: Column(
+        children: [
+          Text(
+            'Select Time',
+            style: TextStyle(
+              color: AppColours.primary,
+              fontSize: 14.fSize,
+              fontWeight: FontWeight.bold,
+            ),
+          ),
+          SizedBox(height: 8.h),
+          SizedBox(
+            height: 160.h,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                _buildWheel(
+                  controller: _hourController,
+                  itemCount: 12,
+                  labelBuilder: (i) => '${i + 1}'.padLeft(2, '0'),
+                  selectedIndex: _selectedHour - 1,
+                  onChanged: (i) => setState(() => _selectedHour = i + 1),
+                ),
+                Text(
+                  ':',
+                  style: TextStyle(
+                    color: AppColours.primary,
+                    fontSize: 20.fSize,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                _buildWheel(
+                  controller: _minuteController,
+                  itemCount: 60,
+                  labelBuilder: (i) => i.toString().padLeft(2, '0'),
+                  selectedIndex: _selectedMinute,
+                  onChanged: (i) => setState(() => _selectedMinute = i),
+                ),
+                _buildWheel(
+                  controller: _periodController,
+                  itemCount: 2,
+                  labelBuilder: (i) => i == 0 ? 'PM' : 'AM',
+                  selectedIndex: _isAM ? 1 : 0,
+                  onChanged: (i) => setState(() => _isAM = i == 1),
+                  width: 48,
+                ),
+              ],
+            ),
+          ),
+          SizedBox(height: 8.h),
+          GestureDetector(
+            onTap: () {
+              setState(() {
+                final period = _isAM ? 'AM' : 'PM';
+                _selectedTimeLabel =
+                    '${_selectedHour.toString().padLeft(2, '0')}:${_selectedMinute.toString().padLeft(2, '0')} $period';
+                _showTimePicker = false;
+              });
+              _notify();
+            },
+            child: Container(
+              width: double.infinity,
+              padding: EdgeInsets.symmetric(vertical: 10.h),
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: AppColours.primary,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                'Save',
+                style: TextStyle(
+                  color: Colors.black,
+                  fontSize: 13.fSize,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInlineCalendar() {
+    final nowMonthStart = DateTime(_todayDateOnly.year, _todayDateOnly.month, 1);
+    final isCurrentMonth = _calendarMonth.year == nowMonthStart.year &&
+        _calendarMonth.month == nowMonthStart.month;
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: 12.w, vertical: 14.h),
+      decoration: BoxDecoration(
+        color: const Color(0xFF16181D),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppColours.primary.withOpacity(0.6)),
+      ),
+      child: Column(
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              IconButton(
+                onPressed: isCurrentMonth
+                    ? null
+                    : () {
+                        setState(() {
+                          _calendarMonth = DateTime(
+                            _calendarMonth.year,
+                            _calendarMonth.month - 1,
+                          );
+                        });
+                      },
+                icon: Icon(
+                  Icons.chevron_left,
+                  color: isCurrentMonth ? Colors.white24 : AppColours.primary,
+                  size: 26,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              ),
+              Text(
+                _monthYearLabel(_calendarMonth),
+                style: TextStyle(
+                  color: AppColours.primary,
+                  fontSize: 15.fSize,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              IconButton(
+                onPressed: () {
+                  setState(() {
+                    _calendarMonth = DateTime(
+                      _calendarMonth.year,
+                      _calendarMonth.month + 1,
+                    );
+                  });
+                },
+                icon: Icon(
+                  Icons.chevron_right,
+                  color: AppColours.primary,
+                  size: 26,
+                ),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              ),
+            ],
+          ),
+          SizedBox(height: 8.h),
+          Row(
+            children: ['S', 'M', 'T', 'W', 'T', 'F', 'S']
+                .map(
+                  (d) => Expanded(
+                    child: Center(
+                      child: Text(
+                        d,
+                        style: TextStyle(
+                          color: AppColours.primary,
+                          fontSize: 11.fSize,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                )
+                .toList(),
+          ),
+          SizedBox(height: 8.h),
+          _buildCalendarGrid(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCalendarGrid() {
+    final y = _calendarMonth.year;
+    final m = _calendarMonth.month;
+    final first = DateTime(y, m, 1);
+    final daysInMonth = DateTime(y, m + 1, 0).day;
+    final leading = first.weekday % 7;
+    final totalCells = ((leading + daysInMonth + 6) ~/ 7) * 7;
+    final cells = <Widget>[];
+
+    for (int i = 0; i < totalCells; i++) {
+      final dayNum = i - leading + 1;
+      if (dayNum < 1 || dayNum > daysInMonth) {
+        cells.add(const SizedBox(height: 40));
+      } else {
+        final date = DateTime(y, m, dayNum);
+        final earliest = widget.allowToday
+            ? _todayDateOnly
+            : _todayDateOnly.add(const Duration(days: 1));
+        final isPastDate = date.isBefore(earliest);
+        final isSelected = _selectedDeliveryDate != null &&
+            _selectedDeliveryDate!.year == date.year &&
+            _selectedDeliveryDate!.month == date.month &&
+            _selectedDeliveryDate!.day == date.day;
+        cells.add(
+          GestureDetector(
+            onTap: isPastDate
+                ? null
+                : () {
+                    setState(() => _selectedDeliveryDate = date);
+                    _notify();
+                  },
+            child: SizedBox(
+              height: 40,
+              child: Center(
+                child: Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: isSelected ? AppColours.primary : Colors.transparent,
+                  ),
+                  alignment: Alignment.center,
+                  child: Text(
+                    '$dayNum',
+                    style: TextStyle(
+                      color: isSelected
+                          ? Colors.black
+                          : (isPastDate ? Colors.white24 : Colors.white70),
+                      fontSize: 14.fSize,
+                      fontWeight:
+                          isSelected ? FontWeight.bold : FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
+    return GridView.count(
+      crossAxisCount: 7,
+      shrinkWrap: true,
+      physics: const NeverScrollableScrollPhysics(),
+      mainAxisSpacing: 4,
+      children: cells,
+    );
+  }
+
+  Widget _buildWheel({
+    required FixedExtentScrollController controller,
+    required int itemCount,
+    required String Function(int) labelBuilder,
+    required int selectedIndex,
+    required ValueChanged<int> onChanged,
+    double width = 52,
+  }) {
+    return SizedBox(
+      width: width.w,
+      child: ListWheelScrollView.useDelegate(
+        controller: controller,
+        itemExtent: 36.h,
+        perspective: 0.003,
+        diameterRatio: 1.6,
+        physics: const FixedExtentScrollPhysics(),
+        onSelectedItemChanged: onChanged,
+        childDelegate: ListWheelChildBuilderDelegate(
+          childCount: itemCount,
+          builder: (context, index) {
+            final isSelected = index == selectedIndex;
+            return Center(
+              child: Text(
+                labelBuilder(index),
+                style: TextStyle(
+                  color: isSelected ? AppColours.primary : AppColours.secondary,
+                  fontSize: isSelected ? 18.fSize : 14.fSize,
+                  fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            );
+          },
         ),
       ),
     );

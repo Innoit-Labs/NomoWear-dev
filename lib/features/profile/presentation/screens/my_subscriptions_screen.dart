@@ -26,14 +26,17 @@ class _MySubscriptionsScreenState extends State<MySubscriptionsScreen> {
   @override
   void initState() {
     super.initState();
+    debugPrint('[SUBSCRIPTION SCREEN] Screen opened -> fetching subscription data...');
     _loadSubscriptions();
   }
 
-  Future<void> _loadSubscriptions() async {
-    setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-    });
+  Future<void> _loadSubscriptions({bool isPullToRefresh = false}) async {
+    if (!isPullToRefresh) {
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+      });
+    }
 
     try {
       final results = await Future.wait([
@@ -46,20 +49,41 @@ class _MySubscriptionsScreenState extends State<MySubscriptionsScreen> {
       final categories = results[1] as List<PlanCategory>;
       final current = ActiveSubscription.pickCurrent(subscriptions);
 
+      debugPrint('================ [SUBSCRIPTION SCREEN DATA] ================');
+      debugPrint('Total Subscriptions: ${subscriptions.length}');
+      if (current != null) {
+        debugPrint('Current Subscription ID: ${current.id}');
+        debugPrint('Current Plan Name: ${current.planName}');
+        debugPrint('Current Status: ${current.planStatus} (isActive: ${current.isActive})');
+        debugPrint('Current Price: ${current.planPrice} / ${current.billingPeriod}');
+        debugPrint('Valid Period: ${current.startDate} -> ${current.endDate}');
+        debugPrint('Bookings: ${current.bookingsUsed ?? 0}/${current.noOfBookings} (remaining: ${current.remainingBookings ?? 0})');
+        debugPrint('Garments: ${current.usedGarments ?? 0}/${current.maxGarments} (remaining: ${current.remainingGarments ?? 0})');
+      } else {
+        debugPrint('Current Subscription: None');
+      }
+      for (int i = 0; i < subscriptions.length; i++) {
+        debugPrint('Subscription [$i]: ${subscriptions[i].toMap()}');
+      }
+      debugPrint('============================================================');
+
       setState(() {
         _subscriptions = subscriptions;
         _categories = categories;
         _currentSubscriptionId = current?.id;
         _isLoading = false;
+        _errorMessage = null;
       });
     } on ApiException catch (e) {
+      debugPrint('[SUBSCRIPTION SCREEN] Error loading subscriptions: ${e.message}');
       if (!mounted) return;
       setState(() {
         _subscriptions = [];
         _isLoading = false;
         _errorMessage = e.message;
       });
-    } catch (_) {
+    } catch (e, stack) {
+      debugPrint('[SUBSCRIPTION SCREEN] Unexpected error: $e\n$stack');
       if (!mounted) return;
       setState(() {
         _subscriptions = [];
@@ -152,47 +176,66 @@ class _MySubscriptionsScreenState extends State<MySubscriptionsScreen> {
     }
 
     if (_errorMessage != null) {
-      return Center(
-        child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: 24.w),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                _errorMessage!,
-                textAlign: TextAlign.center,
-                style: CustomTextStyles.openSansRegular.copyWith(
-                  color: Colors.white70,
-                  fontSize: 14,
-                ),
-              ),
-              SizedBox(height: 16.h),
-              ElevatedButton(
-                onPressed: _loadSubscriptions,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: AppColours.primary,
-                ),
-                child: Text(
-                  'Retry',
-                  style: CustomTextStyles.openSansSemiBold.copyWith(
-                    color: Colors.black,
+      return RefreshIndicator(
+        color: AppColours.primary,
+        backgroundColor: const Color(0xFF16181D),
+        onRefresh: () => _loadSubscriptions(isPullToRefresh: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: EdgeInsets.symmetric(horizontal: 24.w, vertical: 80.h),
+          children: [
+            Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _errorMessage!,
+                    textAlign: TextAlign.center,
+                    style: CustomTextStyles.openSansRegular.copyWith(
+                      color: Colors.white70,
+                      fontSize: 14,
+                    ),
                   ),
-                ),
+                  SizedBox(height: 16.h),
+                  ElevatedButton(
+                    onPressed: () => _loadSubscriptions(isPullToRefresh: false),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: AppColours.primary,
+                    ),
+                    child: Text(
+                      'Retry',
+                      style: CustomTextStyles.openSansSemiBold.copyWith(
+                        color: Colors.black,
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       );
     }
 
     if (_subscriptions.isEmpty) {
-      return Center(
-        child: Text(
-          'No subscriptions found.',
-          style: CustomTextStyles.openSansRegular.copyWith(
-            color: Colors.white54,
-            fontSize: 14,
-          ),
+      return RefreshIndicator(
+        color: AppColours.primary,
+        backgroundColor: const Color(0xFF16181D),
+        onRefresh: () => _loadSubscriptions(isPullToRefresh: true),
+        child: ListView(
+          physics: const AlwaysScrollableScrollPhysics(),
+          padding: EdgeInsets.symmetric(vertical: 120.h),
+          children: [
+            Center(
+              child: Text(
+                'No subscriptions found.',
+                style: CustomTextStyles.openSansRegular.copyWith(
+                  color: Colors.white54,
+                  fontSize: 14,
+                ),
+              ),
+            ),
+          ],
         ),
       );
     }
@@ -200,7 +243,7 @@ class _MySubscriptionsScreenState extends State<MySubscriptionsScreen> {
     return RefreshIndicator(
       color: AppColours.primary,
       backgroundColor: const Color(0xFF16181D),
-      onRefresh: _loadSubscriptions,
+      onRefresh: () => _loadSubscriptions(isPullToRefresh: true),
       child: ListView.separated(
         physics: const AlwaysScrollableScrollPhysics(),
         padding: EdgeInsets.fromLTRB(16.w, 20.h, 16.w, 24.h),

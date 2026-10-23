@@ -37,6 +37,69 @@ class WardrobePlan {
     this.isActive = true,
   });
 
+  bool get isYearlyPlan {
+    final n = name.toLowerCase();
+    if (n.contains('year') || n.contains('annual')) return true;
+
+    final bp = billingPeriod.toLowerCase();
+    if (bp.contains('year') || bp.contains('annual')) return true;
+
+    final code = planCode.toLowerCase();
+    if (code.contains('year') || code.contains('annual')) return true;
+
+    final ref = planRef.toLowerCase();
+    if (ref.contains('year') || ref.contains('annual')) return true;
+
+    if (durationDays >= 300) return true;
+
+    if (features.any((f) {
+      final fl = f.toLowerCase();
+      return fl.contains('/ year') ||
+          fl.contains('/year') ||
+          fl.contains('per year') ||
+          fl.contains('bookings / year') ||
+          fl.contains('days / year');
+    })) {
+      return true;
+    }
+
+    if (yearPrice > 0 && monthPrice <= 0) return true;
+
+    return false;
+  }
+
+  bool get isMonthlyPlan {
+    // If it is explicitly a yearly plan, it cannot be considered a monthly plan
+    if (isYearlyPlan) return false;
+
+    final n = name.toLowerCase();
+    if (n.contains('month')) return true;
+
+    final bp = billingPeriod.toLowerCase();
+    if (bp.contains('month')) return true;
+
+    final code = planCode.toLowerCase();
+    if (code.contains('month')) return true;
+
+    final ref = planRef.toLowerCase();
+    if (ref.contains('month')) return true;
+
+    if (features.any((f) {
+      final fl = f.toLowerCase();
+      return fl.contains('/ month') ||
+          fl.contains('/month') ||
+          fl.contains('per month') ||
+          fl.contains('bookings / month') ||
+          fl.contains('days / month');
+    })) {
+      return true;
+    }
+
+    if (monthPrice > 0 && yearPrice <= 0) return true;
+
+    return false;
+  }
+
   factory WardrobePlan.fromJson(Map<String, dynamic> json) {
     final featuresRaw = json['features'];
     final features = <String>[];
@@ -47,36 +110,142 @@ class WardrobePlan {
       }
     }
 
+    final id = json['id']?.toString() ??
+        json['_id']?.toString() ??
+        json['planId']?.toString() ??
+        json['plan_id']?.toString() ??
+        json['planRef']?.toString() ??
+        json['plan_ref']?.toString() ??
+        '';
+
+    final name = json['name']?.toString() ??
+        json['planName']?.toString() ??
+        json['plan_name']?.toString() ??
+        json['title']?.toString() ??
+        '';
+
+    final billingPeriod = json['billingPeriod']?.toString() ??
+        json['billing_period']?.toString() ??
+        json['period']?.toString() ??
+        json['planType']?.toString() ??
+        json['plan_type']?.toString() ??
+        json['billing_cycle']?.toString() ??
+        json['billingCycle']?.toString() ??
+        json['interval']?.toString() ??
+        json['frequency']?.toString() ??
+        json['type']?.toString() ??
+        '';
+
+    final durationDays = _parseInt(
+      json['durationDays'] ??
+          json['duration_days'] ??
+          json['duration'] ??
+          json['days'],
+    ) ?? 0;
+
+    final bpLower = billingPeriod.toLowerCase();
+    final nameLower = name.toLowerCase();
+    final planCodeLower = (json['planCode'] ?? json['plan_code'] ?? '').toString().toLowerCase();
+
+    final hasYearFeature = features.any((f) {
+      final fl = f.toLowerCase();
+      return fl.contains('/ year') ||
+          fl.contains('/year') ||
+          fl.contains('per year') ||
+          fl.contains('bookings / year') ||
+          fl.contains('days / year');
+    });
+
+    final hasMonthFeature = features.any((f) {
+      final fl = f.toLowerCase();
+      return fl.contains('/ month') ||
+          fl.contains('/month') ||
+          fl.contains('per month') ||
+          fl.contains('bookings / month') ||
+          fl.contains('days / month');
+    });
+
+    final isYearly = bpLower.contains('year') ||
+        bpLower.contains('annual') ||
+        nameLower.contains('year') ||
+        nameLower.contains('annual') ||
+        planCodeLower.contains('year') ||
+        planCodeLower.contains('annual') ||
+        durationDays >= 300 ||
+        (hasYearFeature && !hasMonthFeature);
+
+    final isMonthly = bpLower.contains('month') ||
+        nameLower.contains('month') ||
+        planCodeLower.contains('month') ||
+        (hasMonthFeature && !hasYearFeature);
+
+    final resolvedBillingPeriod = billingPeriod.isNotEmpty
+        ? billingPeriod
+        : (isYearly ? 'yearly' : (isMonthly ? 'monthly' : ''));
+
+    final priceRaw = _parseNum(
+      json['price'] ??
+          json['amount'] ??
+          json['planPrice'] ??
+          json['plan_price'] ??
+          json['cost'],
+    ) ?? 0;
+
+    final monthPriceRaw =
+        _parseNum(json['monthPrice'] ?? json['month_price']) ?? 0;
+    final yearPriceRaw =
+        _parseNum(json['yearPrice'] ?? json['year_price']) ?? 0;
+
+    final monthPrice = monthPriceRaw > 0
+        ? monthPriceRaw
+        : (!isYearly && priceRaw > 0 ? priceRaw : 0);
+
+    final yearPrice = yearPriceRaw > 0
+        ? yearPriceRaw
+        : (isYearly && priceRaw > 0
+            ? priceRaw
+            : (!isMonthly && priceRaw > 0 ? priceRaw : 0));
+
+    final finalPrice = priceRaw > 0
+        ? priceRaw
+        : (monthPrice > 0 ? monthPrice : yearPrice);
+
+    final activeVal = json['isActive'] ??
+        json['is_active'] ??
+        (json['status'] != null
+            ? json['status'].toString().toUpperCase() == 'ACTIVE'
+            : true);
+
     return WardrobePlan(
-      id: json['id']?.toString() ?? '',
+      id: id,
       categoryId: json['categoryId']?.toString() ??
           json['category_id']?.toString() ??
+          json['catgory_id']?.toString() ??
           '',
       categoryName: _nonEmpty(json['categoryName'] ?? json['category_name']),
-      name: json['name']?.toString() ?? '',
+      name: name,
       planCode: json['planCode']?.toString() ??
           json['plan_code']?.toString() ??
+          json['code']?.toString() ??
           '',
       planRef: _nonEmpty(json['planRef'] ?? json['plan_ref']) ??
-          json['id']?.toString() ??
+          (id.isNotEmpty ? id : null) ??
           _nonEmpty(json['planCode'] ?? json['plan_code']) ??
           '',
       description: _nonEmpty(json['description']),
-      durationDays: _parseInt(json['durationDays'] ?? json['duration_days']) ?? 0,
+      durationDays: durationDays,
       maxGarments:
           _parseInt(json['maxGarments'] ?? json['max_garments']) ?? 0,
       noOfBookings:
           _parseInt(json['noOfBookings'] ?? json['no_of_bookings']) ?? 0,
-      monthPrice: _parseNum(json['monthPrice'] ?? json['month_price']) ?? 0,
-      yearPrice: _parseNum(json['yearPrice'] ?? json['year_price']) ?? 0,
-      price: _parseNum(json['price']) ?? 0,
-      billingPeriod: json['billingPeriod']?.toString() ??
-          json['billing_period']?.toString() ??
-          '',
+      monthPrice: monthPrice,
+      yearPrice: yearPrice,
+      price: finalPrice,
+      billingPeriod: resolvedBillingPeriod,
       features: features,
       displayOrder:
           _parseInt(json['displayOrder'] ?? json['display_order']) ?? 0,
-      isActive: _parseBool(json['isActive'] ?? json['is_active'] ?? true),
+      isActive: _parseBool(activeVal),
     );
   }
 }
@@ -85,7 +254,8 @@ bool _parseBool(dynamic value) {
   if (value is bool) return value;
   if (value is int) return value != 0;
   if (value is String) {
-    return value == '1' || value.toLowerCase() == 'true';
+    final lower = value.toLowerCase().trim();
+    return lower == '1' || lower == 'true' || lower == 'active';
   }
   return true;
 }

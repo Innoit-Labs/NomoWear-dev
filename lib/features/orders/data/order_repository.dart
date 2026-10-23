@@ -448,7 +448,7 @@ class OrderRepository {
   }
 
   /// Submits customer refund / cancellation request.
-  /// POST waitlist
+  /// POST mobile/v1/waitlist
   Future<String> submitRefundRequest({
     required String orderId,
     required String orderNumber,
@@ -515,6 +515,55 @@ class OrderRepository {
     return waitlistNum.isNotEmpty
         ? waitlistNum
         : (json['message']?.toString() ?? 'Refund request submitted');
+  }
+
+  /// Submits a free delivery reattempt.
+  /// POST waitlist with waitlist_type CUSTOMER_REORDER_REQUEST.
+  Future<String> submitReorderRequest({
+    required String orderId,
+    required String deliveryDate,
+    required String deliveryTime,
+    String? notes,
+  }) async {
+    final trimmedOrderId = orderId.trim();
+    if (trimmedOrderId.isEmpty) {
+      throw const ApiException('Invalid order id');
+    }
+
+    final authToken = await _authStorage.getAuthToken();
+    if (authToken == null || authToken.isEmpty) {
+      throw const ApiException('Not logged in. Please login again.');
+    }
+
+    final formData = <String, dynamic>{
+      'orderId': trimmedOrderId,
+      'delivery_date': deliveryDate.trim(),
+      'delivery_time': deliveryTime.trim(),
+      'fee': 0,
+      'payment_status': 'FREE',
+    };
+    final note = notes?.trim() ?? '';
+    if (note.isNotEmpty) {
+      formData['notes'] = note;
+    }
+
+    final json = await _apiClient.post(
+      ApiConstants.reorderWaitlistPath,
+      {
+        'waitlist_type': 'CUSTOMER_REORDER_REQUEST',
+        'form_data': formData,
+      },
+      authToken: authToken,
+    );
+
+    if (json['success'] != true) {
+      throw ApiException(
+        json['message']?.toString() ?? 'Failed to submit delivery reattempt',
+      );
+    }
+
+    return json['message']?.toString() ??
+        'Delivery reattempt request submitted successfully.';
   }
 
   /// Gets status of a waitlist item (e.g. CUSTOMER_REFUND_REQUEST).

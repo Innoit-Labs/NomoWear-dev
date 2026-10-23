@@ -352,6 +352,17 @@ class WardrobeBookingFlow {
     if (cartState.wardrobeItems.isEmpty) {
       CheckoutSession.instance.clearBookingModeSelection();
       await session.startNewBooking();
+    } else if (cartState.subscriptionGarmentItems.isNotEmpty ||
+        (cartState.paidRentalGarmentItems.isNotEmpty &&
+            (session.isWithoutSubscriptionPath ||
+                CheckoutSession.instance.continueWithoutMembership))) {
+      if (!context.mounted) return;
+      await _continueChosenBooking(
+        context,
+        wardrobeCategory: wardrobeCategory,
+        wardrobeCategoryId: wardrobeCategoryId,
+      );
+      return;
     }
 
     final hasActiveSubscription = await _hasActiveSubscription();
@@ -518,6 +529,43 @@ class WardrobeBookingFlow {
       wardrobeCategoryId: wardrobeCategoryId,
       useSubscriptionBooking: false,
       replaceCurrentRoute: replaceCurrentRoute,
+    );
+  }
+
+  static Future<void> _continueChosenBooking(
+    BuildContext context, {
+    required String wardrobeCategory,
+    String? wardrobeCategoryId,
+  }) async {
+    final cartState = context.read<CartBloc>().state;
+    final membershipBooking = cartState.subscriptionGarmentItems.isNotEmpty;
+
+    if (membershipBooking && CartLimits.isSubscriptionBookingLimitExhausted()) {
+      logAddToCartLimitResult('BOOKING_LIMIT_REACHED');
+      if (!context.mounted) return;
+      await showUnlockFullAccessDialog(
+        context,
+        onContinueWithoutMembership: () async {
+          if (!context.mounted) return;
+          CheckoutSession.instance.clearWardrobeCategoryLock();
+          await WardrobeBookingSession.instance.beginPaidRentalContinuation();
+          if (!context.mounted) return;
+          await _openWardrobeKitSetup(
+            context,
+            wardrobeCategory: wardrobeCategory,
+            wardrobeCategoryId: wardrobeCategoryId,
+            useSubscriptionBooking: false,
+            preserveContinueWithoutMembership: true,
+          );
+        },
+      );
+      return;
+    }
+
+    await _continueActiveBooking(
+      context,
+      wardrobeCategory: wardrobeCategory,
+      wardrobeCategoryId: wardrobeCategoryId,
     );
   }
 

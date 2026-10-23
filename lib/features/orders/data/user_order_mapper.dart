@@ -113,6 +113,8 @@ class UserOrderMapper {
     }
 
     final kitPrice = matchedKitDetails?.price ?? 0;
+    final pickup = order.pickupDetails;
+    final pickupSavedAddress = _findAddress(customer, pickup?.addressId);
     final action = OrderActionResolver.resolve(
       orderStatus: order.orderStatus,
       returnStatus: order.returnStatus,
@@ -124,6 +126,7 @@ class UserOrderMapper {
       pendingReturn: pendingReturn,
       returnFailed: returnFailed,
       returnResolutionStatus: order.returnResolutionStatus,
+      resolutionStatus: order.resolutionStatus,
     );
 
     return UserOrder(
@@ -169,22 +172,92 @@ class UserOrderMapper {
       deliveryTime: order.resolvedDeliveryTime,
       orderStatusRaw: order.orderStatus,
       kitPrice: kitPrice,
-      pickupDate: order.pickupDetails?.pickupDate,
-      pickupTime: order.pickupDetails?.pickupTime,
-      pickupNote: order.pickupDetails?.note,
-      pickupMobile: order.pickupDetails?.mobile,
-      pickupFullName: order.pickupDetails?.fullName,
-      actionLabel: action.label,
+      pickupDate: pickup?.pickupDate,
+      pickupTime: pickup?.pickupTime,
+      pickupNote: pickup?.note,
+      pickupMobile: _firstNonIap([pickup?.mobile, pickupSavedAddress?.phone]),
+      pickupFullName:
+          _firstNonIap([pickup?.fullName, pickupSavedAddress?.fullName]),
+      pickupAddress: resolvePickupAddress(pickup, customer),
+      actionLabel: canReturn && !inReturnFlow
+          ? OrderActionDecision.returnOrder.label
+          : action.label,
       actionEnabled: action.enabled,
       actionFlow: action.flow,
       returnStatus: order.returnStatus,
+      refundStatus: order.refundStatus,
+      isRefunded: order.isRefunded,
+      refundAmount: order.refundAmount,
+      formattedRefundAmount: order.formattedRefundAmount,
+      refundedAt: completedRefundAt(order),
+      refundCompletedNote: completedRefundNote(order),
       daysLeft: order.daysLeft,
       customerAddressId: order.resolvedCustomerAddressId,
       returnResolutionStatus: order.returnResolutionStatus,
+      resolutionStatus: order.resolutionStatus,
       customerId: order.customerId ?? customer?.id,
       waitlistNumber: order.waitlistNumber,
       returnReattemptCount: order.returnReattemptCount,
     );
+  }
+
+  /// Pickup `full_address` when sent, else the saved address for `addressId`.
+  static String? resolvePickupAddress(
+    OrderPickupDetails? pickup,
+    Customer? customer,
+  ) {
+    return _firstNonIap([
+      pickup?.fullAddress,
+      _formatAddressLines(_findAddress(customer, pickup?.addressId)),
+    ]);
+  }
+
+  static CustomerAddress? _findAddress(Customer? customer, String? id) {
+    final target = id?.trim() ?? '';
+    if (customer == null || target.isEmpty) return null;
+    for (final address in customer.addresses) {
+      if (address.id?.trim() == target) return address;
+    }
+    return null;
+  }
+
+  static String? _firstNonIap(List<String?> values) {
+    for (final value in values) {
+      final text = _cleanText(value);
+      if (text != null && !isIapAddress(text)) return text;
+    }
+    return null;
+  }
+
+  static String? _cleanText(String? value) {
+    final text = value?.trim() ?? '';
+    if (text.isEmpty || text.toLowerCase() == 'null') return null;
+    return text;
+  }
+
+  static DateTime? completedRefundAt(OrderHistoryItem order) {
+    if (order.refundedAt != null) return order.refundedAt;
+    for (final entry in order.statusHistory) {
+      if (entry.status.trim().toUpperCase() != 'REFUNDED') continue;
+      final notes = entry.notes?.toLowerCase() ?? '';
+      if (notes.contains('completed') && entry.timestamp != null) {
+        return entry.timestamp;
+      }
+    }
+    return null;
+  }
+
+  static String? completedRefundNote(OrderHistoryItem order) {
+    final direct = _cleanText(order.refundNotes);
+    if (direct != null) return direct;
+    for (final entry in order.statusHistory) {
+      if (entry.status.trim().toUpperCase() != 'REFUNDED') continue;
+      final notes = _cleanText(entry.notes);
+      if (notes != null && notes.toLowerCase().contains('completed')) {
+        return notes;
+      }
+    }
+    return null;
   }
 
   static bool _apiReturnSettled(OrderHistoryItem order) {
@@ -222,8 +295,8 @@ class UserOrderMapper {
   }) {
     if (order.isReturnComplete) {
       return (
-        label: 'Returned on',
-        date: _formatDisplayDate(order.returnedAt ?? order.rentalEndDate),
+        label: 'Status',
+        date: 'Completed',
       );
     }
 
@@ -340,18 +413,42 @@ class UserOrderMapper {
       }
     }
 
-    matched ??= customer?.primaryAddress;
-
     var lines = _formatAddressLines(matched);
-    if (lines.isEmpty) {
-      lines = (jsonAddress != null && jsonAddress.trim().isNotEmpty)
-          ? jsonAddress.trim()
-          : (order.deliveryAddress?.trim().isNotEmpty == true
-              ? order.deliveryAddress!.trim()
-              : (order.deliveryAddressSnapshot?.trim() ?? ''));
+    if (lines.isEmpty || isIapAddress(lines)) {
+      if (order.customerAddress != null &&
+          order.customerAddress!.trim().isNotEmpty &&
+          !isIapAddress(order.customerAddress)) {
+        lines = order.customerAddress!.trim();
+      } else if (jsonAddress != null &&
+          jsonAddress.trim().isNotEmpty &&
+          !isIapAddress(jsonAddress)) {
+        lines = jsonAddress.trim();
+      } else if (order.deliveryAddress?.trim().isNotEmpty == true &&
+          !isIapAddress(order.deliveryAddress)) {
+        lines = order.deliveryAddress!.trim();
+      } else if (order.deliveryAddressSnapshot?.trim().isNotEmpty == true &&
+          !isIapAddress(order.deliveryAddressSnapshot)) {
+        lines = order.deliveryAddressSnapshot!.trim();
+      } else if (customer != null &&
+          customer.primaryAddress != null &&
+          !isIapAddress(_formatAddressLines(customer.primaryAddress))) {
+        lines = _formatAddressLines(customer.primaryAddress);
+      } else if (customer != null && customer.addresses.isNotEmpty) {
+        for (final a in customer.addresses) {
+          final f = _formatAddressLines(a);
+          if (f.isNotEmpty && !isIapAddress(f)) {
+            lines = f;
+            break;
+          }
+        }
+      }
     }
 
-    var label = (jsonType != null && jsonType.trim().isNotEmpty)
+    if (isIapAddress(lines)) {
+      lines = '';
+    }
+
+    var label = (jsonType != null && jsonType.trim().isNotEmpty && !isIapAddress(jsonType))
         ? jsonType.trim()
         : (matched?.city?.trim().isNotEmpty == true
             ? matched!.city!.trim()
@@ -368,6 +465,19 @@ class UserOrderMapper {
       mobile: mobile,
     );
   }
+
+  static bool isIapAddress(String? s) {
+    if (s == null) return false;
+    final upper = s.trim().toUpperCase();
+    if (upper.isEmpty) return false;
+    return upper.contains('IAP') ||
+        upper.contains('METRO STATION MIYAPUR') ||
+        upper.contains('NADIGADA TANDA') ||
+        upper.startsWith('IAP');
+  }
+
+  static String formatAddress(CustomerAddress? address) =>
+      _formatAddressLines(address);
 
   static String _formatAddressLines(CustomerAddress? address) {
     if (address == null) return '';
@@ -605,9 +715,91 @@ class UserOrderMapper {
     final suffix = _daySuffix(date.day).toUpperCase();
     final time = order.resolvedDeliveryTime?.trim();
     if (time != null && time.isNotEmpty) {
-      return '${day}$suffix ${months[date.month - 1]}, $time';
+      return '$day$suffix ${months[date.month - 1]}, $time';
     }
-    return '${day}$suffix ${months[date.month - 1]}';
+    return '$day$suffix ${months[date.month - 1]}';
+  }
+
+  static String? formatDateDdMmYyyy(dynamic value) {
+    if (value == null) return null;
+    if (value is DateTime) {
+      final dd = value.day.toString().padLeft(2, '0');
+      final mm = value.month.toString().padLeft(2, '0');
+      final yyyy = value.year.toString().padLeft(4, '0');
+      return '$dd-$mm-$yyyy';
+    }
+
+    final text = value.toString().trim();
+    if (text.isEmpty || text.toLowerCase() == 'null' || text == '-') return null;
+
+    final parsed = DateTime.tryParse(text);
+    if (parsed != null) {
+      final dd = parsed.day.toString().padLeft(2, '0');
+      final mm = parsed.month.toString().padLeft(2, '0');
+      final yyyy = parsed.year.toString().padLeft(4, '0');
+      return '$dd-$mm-$yyyy';
+    }
+
+    final digitsMatch = RegExp(r'^(\d{1,4})[/-](\d{1,2})[/-](\d{1,4})').firstMatch(text);
+    if (digitsMatch != null) {
+      final p1 = digitsMatch.group(1)!;
+      final p2 = digitsMatch.group(2)!;
+      final p3 = digitsMatch.group(3)!;
+
+      if (p1.length == 4) {
+        final yyyy = p1;
+        final mm = (int.tryParse(p2) ?? 1).toString().padLeft(2, '0');
+        final dd = (int.tryParse(p3) ?? 1).toString().padLeft(2, '0');
+        return '$dd-$mm-$yyyy';
+      } else {
+        final dd = (int.tryParse(p1) ?? 1).toString().padLeft(2, '0');
+        final mm = (int.tryParse(p2) ?? 1).toString().padLeft(2, '0');
+        var yyyy = p3;
+        if (yyyy.length == 2) {
+          yyyy = '20$yyyy';
+        } else {
+          yyyy = yyyy.padLeft(4, '0');
+        }
+        return '$dd-$mm-$yyyy';
+      }
+    }
+
+    const months = {
+      'jan': '01', 'january': '01',
+      'feb': '02', 'february': '02',
+      'mar': '03', 'march': '03',
+      'apr': '04', 'april': '04',
+      'may': '05',
+      'jun': '06', 'june': '06',
+      'jul': '07', 'july': '07',
+      'aug': '08', 'august': '08',
+      'sep': '09', 'september': '09',
+      'oct': '10', 'october': '10',
+      'nov': '11', 'november': '11',
+      'dec': '12', 'december': '12',
+    };
+
+    final dayMonthMatch = RegExp(r'(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})(?:[\s,]+(\d{2,4}))?').firstMatch(text);
+    if (dayMonthMatch != null) {
+      final dd = (int.tryParse(dayMonthMatch.group(1)!) ?? 1).toString().padLeft(2, '0');
+      final monthName = dayMonthMatch.group(2)!.toLowerCase();
+      final mm = months[monthName] ?? months[monthName.substring(0, 3.clamp(0, monthName.length))] ?? '01';
+      var yyyy = dayMonthMatch.group(3) ?? DateTime.now().year.toString();
+      if (yyyy.length == 2) yyyy = '20$yyyy';
+      return '$dd-$mm-$yyyy';
+    }
+
+    final monthDayMatch = RegExp(r'([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?(?:[\s,]+(\d{2,4}))?').firstMatch(text);
+    if (monthDayMatch != null) {
+      final monthName = monthDayMatch.group(1)!.toLowerCase();
+      final mm = months[monthName] ?? months[monthName.substring(0, 3.clamp(0, monthName.length))] ?? '01';
+      final dd = (int.tryParse(monthDayMatch.group(2)!) ?? 1).toString().padLeft(2, '0');
+      var yyyy = monthDayMatch.group(3) ?? DateTime.now().year.toString();
+      if (yyyy.length == 2) yyyy = '20$yyyy';
+      return '$dd-$mm-$yyyy';
+    }
+
+    return text;
   }
 
   static String _daySuffix(int day) {

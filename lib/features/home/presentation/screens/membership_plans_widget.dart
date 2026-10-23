@@ -7,10 +7,12 @@ import 'package:nomowear/features/plans/data/plan_repository.dart';
 
 class MembershipPlansWidget extends StatefulWidget {
   final void Function(PlanCategory category) onOpenPlans;
+  final Future<void> Function()? onRefresh;
 
   const MembershipPlansWidget({
     Key? key,
     required this.onOpenPlans,
+    this.onRefresh,
   }) : super(key: key);
 
   @override
@@ -92,7 +94,7 @@ class _MembershipPlansWidgetState extends State<MembershipPlansWidget> {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    final body = Container(
       margin: EdgeInsets.fromLTRB(16.w, 0, 16.w, 16.h),
       child: Column(
         children: [
@@ -125,6 +127,27 @@ class _MembershipPlansWidgetState extends State<MembershipPlansWidget> {
           ),
           SizedBox(height: 12.h),
           Expanded(child: _buildPlansBody()),
+        ],
+      ),
+    );
+
+    return RefreshIndicator(
+      color: AppColours.primary,
+      backgroundColor: const Color(0xFF16181D),
+      onRefresh: () async {
+        debugPrint('[MEMBERSHIP PLANS] Pull to refresh triggered');
+        await Future.wait([
+          _loadCategories(forceRefresh: true),
+          if (widget.onRefresh != null) widget.onRefresh!(),
+        ]);
+      },
+      child: CustomScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        slivers: [
+          SliverFillRemaining(
+            hasScrollBody: false,
+            child: body,
+          ),
         ],
       ),
     );

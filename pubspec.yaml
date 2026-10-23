@@ -49,6 +49,7 @@ dependencies:
   latlong2: ^0.9.1
   firebase_core: ^4.15.0
   firebase_messaging: ^16.7.0
+  smart_auth: ^3.2.0
 
 dev_dependencies:
   flutter_test:

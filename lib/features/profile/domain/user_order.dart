@@ -79,6 +79,7 @@ class UserOrder {
   final String? pickupNote;
   final String? pickupMobile;
   final String? pickupFullName;
+  final String? pickupAddress;
   final String actionLabel;
   final bool actionEnabled;
   final OrderActionFlow actionFlow;
@@ -129,39 +130,71 @@ class UserOrder {
     this.pickupNote,
     this.pickupMobile,
     this.pickupFullName,
+    this.pickupAddress,
     this.actionLabel = 'Track Your Order',
     this.actionEnabled = true,
     this.actionFlow = OrderActionFlow.forward,
     this.returnStatus,
     this.refundStatus,
+    this.isRefunded = false,
+    this.refundAmount = 0,
+    this.formattedRefundAmount,
+    this.refundedAt,
+    this.refundCompletedNote,
     this.daysLeft,
     this.customerAddressId,
     this.hasReturnFailed = false,
     this.canReattemptReturn = false,
     this.rejectionReason,
     this.returnResolutionStatus,
+    this.resolutionStatus,
     this.customerId,
     this.waitlistNumber,
     this.returnReattemptCount = 0,
   });
 
   final String? refundStatus;
+  final bool isRefunded;
+  final num refundAmount;
+  final String? formattedRefundAmount;
+  final DateTime? refundedAt;
+  final String? refundCompletedNote;
   final bool hasReturnFailed;
   final bool canReattemptReturn;
   final String? rejectionReason;
   final String? returnResolutionStatus;
+  final String? resolutionStatus;
   final String? customerId;
   final String? waitlistNumber;
   final int returnReattemptCount;
 
+  bool get isReturnComplete {
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    final ret = (returnStatus ?? '').trim().toUpperCase();
+    return status == 'RETURNED_TO_IAP' ||
+        status == 'RETURNED' ||
+        ret == 'RETURNED_TO_IAP' ||
+        ret == 'RETURNED';
+  }
+
+  bool get isReorderRequested {
+    final resolution = (resolutionStatus ?? '').trim().toUpperCase();
+    final status = (orderStatusRaw ?? '').trim().toUpperCase();
+    if (isDelivered || status == 'DELIVERED' || status == 'COMPLETED') {
+      return false;
+    }
+    return resolution == 'REORDER_REQUESTED' || status == 'REORDER_REQUESTED';
+  }
+
   bool get isDeliveryReattemptEligible {
+    if (isReorderRequested || isReturnComplete) return false;
     final status = (orderStatusRaw ?? '').trim().toUpperCase();
     return status == 'NOT_DELIVERED' ||
-        status == 'DELIVERY_FAILED' ||
-        status == 'RETURNED_TO_IAP';
+        status == 'DELIVERY_FAILED';
   }
 
   bool get isReturnFailed {
+    if (isReturnComplete) return false;
     final status = (orderStatusRaw ?? '').trim().toUpperCase();
     return status == 'RETURN_FAILED' ||
         status == 'RETURN_REJECTED' ||
@@ -169,6 +202,7 @@ class UserOrder {
   }
 
   bool get isReturnEscalated {
+    if (isReturnComplete) return false;
     final status = (orderStatusRaw ?? '').trim().toUpperCase();
     return returnReattemptCount >= 2 || status == 'ESCALATION_ACTIVE';
   }
@@ -176,6 +210,15 @@ class UserOrder {
   bool get isRefundEligible {
     final isNonSub = orderType?.trim().toUpperCase() == 'NON_SUBSCRIPTION';
     if (!isNonSub) return false;
+    if (isDelivered || isInReturnFlow || isReturnFailed || isReturnComplete) {
+      return false;
+    }
+    final retStatus = (returnStatus ?? '').trim().toUpperCase();
+    if (retStatus.isNotEmpty &&
+        retStatus != 'ACTIVE' &&
+        retStatus != 'NOT_DELIVERED') {
+      return false;
+    }
     final status = (orderStatusRaw ?? '').trim().toUpperCase();
     const disallowed = [
       'READY_FOR_DELIVERY',
@@ -185,10 +228,34 @@ class UserOrder {
       'COMPLETED',
       'CANCELLED',
       'REFUNDED',
+      'RETURN_REQUESTED',
+      'RETURN_PENDING',
+      'PICKUP_SCHEDULED',
+      'RETURN_APPROVED',
+      'APPROVED',
+      'RETURNED',
+      'RETURNED_TO_IAP',
+      'RETURN_FAILED',
+      'ESCALATION_ACTIVE',
     ];
     if (disallowed.contains(status)) return false;
     if (refundStatus?.trim().toUpperCase() == 'REFUNDED') return false;
+    if (isRefunded) return false;
     return true;
+  }
+
+  bool get isRefundCompleted {
+    if (isRefunded) return true;
+    return refundStatus?.trim().toUpperCase() == 'REFUNDED';
+  }
+
+  String? get refundAmountLabel {
+    final formatted = formattedRefundAmount?.trim() ?? '';
+    if (formatted.isNotEmpty && formatted.toLowerCase() != 'null') {
+      return formatted;
+    }
+    if (refundAmount > 0) return '₹$refundAmount';
+    return null;
   }
 
   bool get isReturnReattemptPending =>
@@ -233,12 +300,24 @@ class UserOrder {
     OrderActionFlow? actionFlow,
     String? returnStatus,
     String? refundStatus,
+    bool? isRefunded,
+    num? refundAmount,
+    String? formattedRefundAmount,
+    DateTime? refundedAt,
+    String? refundCompletedNote,
     int? daysLeft,
     String? customerAddressId,
     String? returnResolutionStatus,
+    String? resolutionStatus,
     String? customerId,
     String? waitlistNumber,
     int? returnReattemptCount,
+    String? pickupDate,
+    String? pickupTime,
+    String? pickupNote,
+    String? pickupMobile,
+    String? pickupFullName,
+    String? pickupAddress,
   }) {
     return UserOrder(
       id: id ?? this.id,
@@ -267,6 +346,7 @@ class UserOrder {
       rejectionReason: rejectionReason ?? this.rejectionReason,
       returnResolutionStatus:
           returnResolutionStatus ?? this.returnResolutionStatus,
+      resolutionStatus: resolutionStatus ?? this.resolutionStatus,
       customerId: customerId ?? this.customerId,
       waitlistNumber: waitlistNumber ?? this.waitlistNumber,
       returnReattemptCount: returnReattemptCount ?? this.returnReattemptCount,
@@ -275,13 +355,20 @@ class UserOrder {
       actionFlow: actionFlow ?? this.actionFlow,
       returnStatus: returnStatus ?? this.returnStatus,
       refundStatus: refundStatus ?? this.refundStatus,
+      isRefunded: isRefunded ?? this.isRefunded,
+      refundAmount: refundAmount ?? this.refundAmount,
+      formattedRefundAmount:
+          formattedRefundAmount ?? this.formattedRefundAmount,
+      refundedAt: refundedAt ?? this.refundedAt,
+      refundCompletedNote: refundCompletedNote ?? this.refundCompletedNote,
       daysLeft: daysLeft ?? this.daysLeft,
       customerAddressId: customerAddressId ?? this.customerAddressId,
-      pickupDate: pickupDate,
-      pickupTime: pickupTime,
-      pickupNote: pickupNote,
-      pickupMobile: pickupMobile,
-      pickupFullName: pickupFullName,
+      pickupDate: pickupDate ?? this.pickupDate,
+      pickupTime: pickupTime ?? this.pickupTime,
+      pickupNote: pickupNote ?? this.pickupNote,
+      pickupMobile: pickupMobile ?? this.pickupMobile,
+      pickupFullName: pickupFullName ?? this.pickupFullName,
+      pickupAddress: pickupAddress ?? this.pickupAddress,
     );
   }
 }

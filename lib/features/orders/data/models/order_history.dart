@@ -8,6 +8,9 @@ class OrderPickupDetails {
     this.note,
     this.fullName,
     this.mobile,
+    this.fullAddress,
+    this.latitude,
+    this.longitude,
   });
 
   final String? addressId;
@@ -16,18 +19,56 @@ class OrderPickupDetails {
   final String? note;
   final String? fullName;
   final String? mobile;
+  final String? fullAddress;
+  final double? latitude;
+  final double? longitude;
+
+  bool get hasDisplayContent {
+    bool filled(String? value) => value != null && value.trim().isNotEmpty;
+    return filled(pickupDate) ||
+        filled(pickupTime) ||
+        filled(note) ||
+        filled(fullName) ||
+        filled(mobile) ||
+        filled(fullAddress);
+  }
+
+  static String? _text(dynamic value) {
+    final text = value?.toString().trim() ?? '';
+    if (text.isEmpty || text.toLowerCase() == 'null') return null;
+    return text;
+  }
+
+  static double? _coord(dynamic value) {
+    if (value is num) return value.toDouble();
+    return double.tryParse(value?.toString() ?? '');
+  }
 
   factory OrderPickupDetails.fromJson(Map<String, dynamic> json) {
+    final rawAddress = json['address'];
+    final address = rawAddress is Map
+        ? Map<String, dynamic>.from(rawAddress)
+        : const <String, dynamic>{};
     return OrderPickupDetails(
-      addressId: json['addressId']?.toString() ??
-          json['address_id']?.toString(),
-      pickupDate: json['pickup_date']?.toString() ??
-          json['pickupDate']?.toString(),
-      pickupTime: json['pickup_time']?.toString() ??
-          json['pickupTime']?.toString(),
-      note: json['note']?.toString(),
-      fullName: json['fullName']?.toString() ?? json['full_name']?.toString(),
-      mobile: json['mobile']?.toString() ?? json['phone']?.toString(),
+      addressId: _text(
+        json['addressId'] ?? json['address_id'] ?? address['id'],
+      ),
+      pickupDate: _text(json['pickup_date'] ?? json['pickupDate']),
+      pickupTime: _text(json['pickup_time'] ?? json['pickupTime']),
+      note: _text(json['note']),
+      fullName: _text(
+        json['fullName'] ?? json['full_name'] ?? address['fullName'],
+      ),
+      mobile: _text(json['mobile'] ?? json['phone'] ?? address['mobile']),
+      fullAddress: _text(
+        json['full_address'] ??
+            json['fullAddress'] ??
+            address['full_address'] ??
+            address['fullAddress'] ??
+            (rawAddress is Map ? null : rawAddress),
+      ),
+      latitude: _coord(json['latitude'] ?? address['latitude']),
+      longitude: _coord(json['longitude'] ?? address['longitude']),
     );
   }
 }
@@ -77,7 +118,15 @@ class OrderHistoryItem {
     this.rejectionReason,
     this.isReturnWaitlisted = false,
     this.refundStatus,
+    this.isRefunded = false,
+    this.refundAmount = 0,
+    this.formattedRefundAmount,
+    this.refundedAt,
+    this.refundNotes,
     this.returnResolutionStatus,
+    this.resolutionStatus,
+    this.orderNote,
+    this.waitlistPickupDetails,
     this.customerId,
     this.waitlistNumber,
     this.returnReattemptCount = 0,
@@ -126,16 +175,33 @@ class OrderHistoryItem {
   final String? rejectionReason;
   final bool isReturnWaitlisted;
   final String? refundStatus;
+  final bool isRefunded;
+  final num refundAmount;
+  final String? formattedRefundAmount;
+  final DateTime? refundedAt;
+  final String? refundNotes;
   final String? returnResolutionStatus;
+  final String? resolutionStatus;
+  final String? orderNote;
+
+  /// `waitlist_ticket.pickup_details` — pickup requested with the return.
+  final OrderPickupDetails? waitlistPickupDetails;
   final String? customerId;
   final String? waitlistNumber;
   final int returnReattemptCount;
 
+  bool get isReorderRequested {
+    final resolution = (resolutionStatus ?? '').trim().toUpperCase();
+    final status = (orderStatus ?? '').trim().toUpperCase();
+    if (isDelivered) return false;
+    return resolution == 'REORDER_REQUESTED' || status == 'REORDER_REQUESTED';
+  }
+
   bool get isDeliveryReattemptEligible {
+    if (isReorderRequested || isReturnComplete) return false;
     final status = (orderStatus ?? '').trim().toUpperCase();
     return status == 'NOT_DELIVERED' ||
-        status == 'DELIVERY_FAILED' ||
-        status == 'RETURNED_TO_IAP';
+        status == 'DELIVERY_FAILED';
   }
 
   static const _returnFlowStatuses = {
@@ -193,7 +259,7 @@ class OrderHistoryItem {
   }
 
   bool get isInReturnFlow {
-    if (canReattemptReturn || hasReturnFailed) return false;
+    if (canReattemptReturn || hasReturnFailed || isReturnComplete) return false;
     final status = orderStatus?.trim().toUpperCase() ?? '';
     if (_returnFlowStatuses.contains(status)) return true;
     final rs = returnStatus?.trim().toUpperCase();
@@ -227,6 +293,11 @@ class OrderHistoryItem {
   String get trackingCurrentStatus {
     if (hasReturnFailed) return 'RETURN_FAILED';
     final order = normalizedOrderStatus;
+    if (isReturnComplete ||
+        order == 'RETURNED' ||
+        order == 'RETURNED_TO_IAP') {
+      return order == 'RETURNED_TO_IAP' ? 'RETURNED_TO_IAP' : 'RETURNED';
+    }
     if (_returnFlowStatuses.contains(order)) return order;
     final rs = returnStatus?.trim().toUpperCase() ?? '';
     if (shouldShowReturnTimeline &&
@@ -244,13 +315,11 @@ class OrderHistoryItem {
     if (hasReturnFailed) return false;
     if (returnedAt != null) return true;
     final status = orderStatus?.trim().toUpperCase() ?? '';
-    if (status == 'RETURNED' ||
-        status == 'RETURN_APPROVED' ||
-        status == 'APPROVED') {
+    if (status == 'RETURNED' || status == 'RETURNED_TO_IAP') {
       return true;
     }
     final rs = returnStatus?.trim().toUpperCase() ?? '';
-    return rs == 'RETURN_APPROVED' || rs == 'RETURNED' || rs == 'APPROVED';
+    return rs == 'RETURNED' || rs == 'RETURNED_TO_IAP';
   }
 
   bool get isSubscription =>
@@ -406,9 +475,23 @@ class OrderHistoryItem {
       ),
       refundStatus: json['refund_status']?.toString() ??
           json['refundStatus']?.toString(),
+      isRefunded: _bool(json['is_refunded'] ?? json['isRefunded']),
+      refundAmount: _num(json['refund_amount'] ?? json['refundAmount']),
+      formattedRefundAmount: json['formatted_refund_amount']?.toString() ??
+          json['formattedRefundAmount']?.toString(),
+      refundedAt: _dateTime(json['refunded_at'] ?? json['refundedAt']),
+      refundNotes: json['refund_notes']?.toString() ??
+          json['refundNotes']?.toString(),
       returnResolutionStatus:
           json['return_resolution_status']?.toString() ??
           json['returnResolutionStatus']?.toString(),
+      resolutionStatus: json['resolution_status']?.toString() ??
+          json['resolutionStatus']?.toString(),
+      orderNote: json['order_note']?.toString() ??
+          json['orderNote']?.toString(),
+      waitlistPickupDetails: _parseWaitlistPickup(
+        json['waitlist_ticket'] ?? json['waitlistTicket'],
+      ),
       customerId: json['customer_id']?.toString() ??
           json['customerId']?.toString(),
       waitlistNumber: json['waitlist_number']?.toString() ??
@@ -432,6 +515,18 @@ class OrderHistoryItem {
     }
     if (raw is! Map) return null;
     return OrderPickupDetails.fromJson(Map<String, dynamic>.from(raw));
+  }
+
+  static OrderPickupDetails? _parseWaitlistPickup(dynamic raw) {
+    if (raw is String && raw.trim().isNotEmpty) {
+      try {
+        raw = jsonDecode(raw);
+      } catch (_) {
+        return null;
+      }
+    }
+    if (raw is! Map) return null;
+    return _parsePickupDetails(raw['pickup_details'] ?? raw['pickupDetails']);
   }
 
   static List<OrderHistoryLineItem> _parseItems(dynamic raw) {
@@ -759,15 +854,18 @@ class OrderStatusHistoryEntry {
   const OrderStatusHistoryEntry({
     required this.status,
     this.timestamp,
+    this.notes,
   });
 
   final String status;
   final DateTime? timestamp;
+  final String? notes;
 
   factory OrderStatusHistoryEntry.fromJson(Map<String, dynamic> json) {
     return OrderStatusHistoryEntry(
       status: json['status']?.toString() ?? '',
       timestamp: OrderHistoryItem._dateTime(json['timestamp']),
+      notes: json['notes']?.toString(),
     );
   }
 }

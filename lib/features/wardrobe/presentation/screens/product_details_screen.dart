@@ -89,8 +89,75 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
           : [_product.imageUrl];
 
   List<String> get _allImages {
-    if (_product.imageUrls.length > 1) return _product.imageUrls;
-    return _colorImages.length > 1 ? _colorImages : [_product.imageUrl];
+    final images = <String>[];
+    final variantImg = _selectedVariant?.primaryImageUrl?.trim();
+    if (variantImg != null && variantImg.isNotEmpty) {
+      images.add(variantImg);
+    }
+    if (_selectedColor != null) {
+      for (final v in _product.variants) {
+        final vColor = _variantOptionValue(v.options, 'Color')?.toUpperCase();
+        if (vColor == _selectedColor!.toUpperCase()) {
+          final img = v.primaryImageUrl?.trim();
+          if (img != null && img.isNotEmpty && !images.contains(img)) {
+            images.add(img);
+          }
+        }
+      }
+    }
+    if (_product.imageUrls.isNotEmpty) {
+      for (final u in _product.imageUrls) {
+        final trimmed = u.trim();
+        if (trimmed.isNotEmpty && !images.contains(trimmed)) {
+          images.add(trimmed);
+        }
+      }
+    }
+    for (final u in _colorImages) {
+      final trimmed = u.trim();
+      if (trimmed.isNotEmpty && !images.contains(trimmed)) {
+        images.add(trimmed);
+      }
+    }
+    if (images.isEmpty && _product.imageUrl.trim().isNotEmpty) {
+      images.add(_product.imageUrl.trim());
+    }
+    return images;
+  }
+
+  String _imageUrlForColor(int index) {
+    if (index >= 0 && index < _availableColors.length) {
+      final color = _availableColors[index].toUpperCase();
+      for (final v in _product.variants) {
+        final vColor = _variantOptionValue(v.options, 'Color')?.toUpperCase();
+        if (vColor != null && vColor == color) {
+          final img = v.primaryImageUrl?.trim();
+          if (img != null && img.isNotEmpty) return img;
+        }
+      }
+    }
+    if (index < _colorImages.length) {
+      final img = _colorImages[index].trim();
+      if (img.isNotEmpty) return img;
+    }
+    return _product.imageUrl.trim();
+  }
+
+  bool get _hasAnyColorImages {
+    for (int i = 0; i < _availableColors.length; i++) {
+      if (_imageUrlForColor(i).isNotEmpty) return true;
+    }
+    return false;
+  }
+
+  bool get _shouldShowColorSection {
+    if (_availableColors.isEmpty) return false;
+    if (_availableColors.length == 1) {
+      final single = _availableColors.first.trim().toUpperCase();
+      if (single == 'DEFAULT' || single.isEmpty) return false;
+      if (!_hasAnyColorImages) return false;
+    }
+    return true;
   }
 
   String? _variantOptionValue(Map<String, String> options, String key) {
@@ -380,8 +447,10 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _buildImageCarousel(),
-                        SizedBox(height: 16.h),
+                        if (_allImages.isNotEmpty) ...[
+                          _buildImageCarousel(),
+                          SizedBox(height: 16.h),
+                        ],
                         _buildTitleRow(),
                         if (_shouldShowPrice) ...[
                           SizedBox(height: 6.h),
@@ -389,8 +458,10 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
                         ],
                         SizedBox(height: 8.h),
                         _buildDescription(),
-                        SizedBox(height: 20.h),
-                        _buildColorSection(),
+                        if (_shouldShowColorSection) ...[
+                          SizedBox(height: 20.h),
+                          _buildColorSection(),
+                        ],
                         SizedBox(height: 20.h),
                         _buildSizeSection(),
                         SizedBox(height: 20.h),
@@ -505,6 +576,8 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
 
   // ── Image Carousel ──────────────────────────────────────────────────────
   Widget _buildImageCarousel() {
+    if (_allImages.isEmpty) return const SizedBox.shrink();
+
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: 16.w),
       child: LayoutBuilder(
@@ -729,6 +802,8 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
 
   // ── Color Section ───────────────────────────────────────────────────────
   Widget _buildColorSection() {
+    if (!_shouldShowColorSection) return const SizedBox.shrink();
+
     return Padding(
       padding: EdgeInsets.symmetric(horizontal: 20.w),
       child: Column(
@@ -739,74 +814,141 @@ class _ProductDetailsScreenState extends State<ProductDetailsScreen> {
               children: [
                 TextSpan(
                   text: 'SELECTED COLOR: ',
-                  style: CustomTextStyles.montserratSemiBold.copyWith(fontSize: 14)
-
+                  style: CustomTextStyles.montserratSemiBold.copyWith(fontSize: 14),
                 ),
                 TextSpan(
                   text: _selectedColorName,
-                    style: CustomTextStyles.montserratSemiBold.copyWith(fontSize: 14,color: AppColours.primary)
-
+                  style: CustomTextStyles.montserratSemiBold.copyWith(
+                    fontSize: 14,
+                    color: AppColours.primary,
+                  ),
                 ),
               ],
             ),
           ),
           SizedBox(height: 12.h),
-          SizedBox(
-            height: 62.h,
-            child: ListView.separated(
-              scrollDirection: Axis.horizontal,
-              itemCount: _availableColors.length,
-              separatorBuilder: (_, __) => SizedBox(width: 10.w),
-              itemBuilder: (_, index) {
-                final isActive = _selectedColorIndex == index;
-                return GestureDetector(
-                  onTap: () {
-                    setState(() {
-                      _selectedColorIndex = index;
-                      final sizes = _sizes;
-                      if (sizes.isNotEmpty &&
-                          !sizes.any(
-                            (s) =>
-                                s.toUpperCase() ==
-                                _selectedSize.toUpperCase(),
-                          )) {
-                        _selectedSize = sizes.first;
-                      }
-                    });
-                    if (_allImages.isNotEmpty) {
-                      _goToImage(index.clamp(0, _allImages.length - 1));
-                    }
-                  },
-                  child: Container(
-                    width: 62.w,
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(8),
-                      border: Border.all(
-                        color: isActive
-                            ? AppColours.primary
-                            : Colors.white12,
-                        width: isActive ? 2 : 1,
-                      ),
-                    ),
-                    child: ClipRRect(
+          _hasAnyColorImages ? _buildColorThumbnails() : _buildColorTextChips(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildColorThumbnails() {
+    return SizedBox(
+      height: 62.h,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _availableColors.length,
+        separatorBuilder: (_, __) => SizedBox(width: 10.w),
+        itemBuilder: (_, index) {
+          final isActive = _selectedColorIndex == index;
+          final colorName = _availableColors[index];
+          final imageUrl = _imageUrlForColor(index);
+          final hasImage = imageUrl.isNotEmpty;
+
+          return GestureDetector(
+            onTap: () => _onSelectColor(index),
+            child: Container(
+              width: hasImage ? 62.w : null,
+              constraints: BoxConstraints(minWidth: 62.w),
+              padding: hasImage ? EdgeInsets.zero : EdgeInsets.symmetric(horizontal: 10.w),
+              decoration: BoxDecoration(
+                color: const Color(0xFF16181D),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: isActive
+                      ? AppColours.primary
+                      : Colors.white12,
+                  width: isActive ? 2 : 1,
+                ),
+              ),
+              child: hasImage
+                  ? ClipRRect(
                       borderRadius: BorderRadius.circular(7),
                       child: ProductImage(
-                        imageUrl: index < _colorImages.length
-                            ? _colorImages[index]
-                            : _product.imageUrl,
+                        imageUrl: imageUrl,
                         fit: BoxFit.fill,
                         width: double.infinity,
                         height: double.infinity,
                       ),
+                    )
+                  : Center(
+                      child: Text(
+                        colorName,
+                        maxLines: 2,
+                        textAlign: TextAlign.center,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: isActive
+                              ? AppColours.primary
+                              : Colors.white70,
+                          fontSize: 11.fSize,
+                          fontWeight: isActive
+                              ? FontWeight.bold
+                              : FontWeight.w500,
+                        ),
+                      ),
                     ),
-                  ),
-                );
-              },
             ),
-          ),
-        ],
+          );
+        },
       ),
     );
+  }
+
+  Widget _buildColorTextChips() {
+    return SizedBox(
+      height: 38.h,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        itemCount: _availableColors.length,
+        separatorBuilder: (_, __) => SizedBox(width: 8.w),
+        itemBuilder: (_, index) {
+          final isActive = _selectedColorIndex == index;
+          final colorName = _availableColors[index];
+
+          return GestureDetector(
+            onTap: () => _onSelectColor(index),
+            child: Container(
+              padding: EdgeInsets.symmetric(horizontal: 14.w),
+              decoration: BoxDecoration(
+                color: isActive ? AppColours.primary : const Color(0xFF16181D),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(
+                  color: isActive ? AppColours.primary : Colors.white24,
+                  width: 1,
+                ),
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                colorName,
+                style: TextStyle(
+                  color: isActive ? Colors.black : Colors.white,
+                  fontSize: 12.fSize,
+                  fontWeight: isActive ? FontWeight.bold : FontWeight.w600,
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _onSelectColor(int index) {
+    setState(() {
+      _selectedColorIndex = index;
+      final sizes = _sizes;
+      if (sizes.isNotEmpty &&
+          !sizes.any(
+            (s) => s.toUpperCase() == _selectedSize.toUpperCase(),
+          )) {
+        _selectedSize = sizes.first;
+      }
+    });
+    if (_allImages.isNotEmpty) {
+      _goToImage(0);
+    }
   }
 
   // ── Size Section ────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ class OrderSummary {
     required this.total,
     required this.wardrobeKitAmount,
     required this.essentialsAmount,
+    this.securityDepositAmount = 0,
   });
 
   final int subtotal;
@@ -21,6 +22,7 @@ class OrderSummary {
   final int total;
   final int wardrobeKitAmount;
   final int essentialsAmount;
+  final int securityDepositAmount;
 }
 
 /// Backend-only payable snapshot: cart breakdown + order-initiate amount (Razorpay).
@@ -132,6 +134,15 @@ class CheckoutPricing {
             ? initiate.displayRupees
             : (effectiveSubtotal + effectiveDelivery + effectiveGst - effectiveDiscount));
 
+    final depositFromCart = remoteCart.securityDepositAmount.round();
+    final baseWithoutDeposit =
+        effectiveSubtotal + effectiveDelivery + effectiveGst - effectiveDiscount;
+    final computedDeposit = effectiveTotal > baseWithoutDeposit
+        ? (effectiveTotal - baseWithoutDeposit)
+        : 0;
+    final effectiveDeposit =
+        depositFromCart > 0 ? depositFromCart : computedDeposit;
+
     final summary = OrderSummary(
       subtotal: effectiveSubtotal,
       deliveryFee: effectiveDelivery,
@@ -140,6 +151,7 @@ class CheckoutPricing {
       total: effectiveTotal,
       wardrobeKitAmount: wardrobeKitAmount,
       essentialsAmount: 0,
+      securityDepositAmount: effectiveDeposit,
     );
 
     final gatewayPaise = initiate.amount > 0

@@ -6,6 +6,7 @@ import 'package:nomowear/routes/app_routes.dart';
 import 'package:nomowear/features/profile/data/profile_repository.dart';
 import 'package:nomowear/features/profile/domain/user_order.dart';
 import 'package:nomowear/features/orders/data/order_repository.dart';
+import 'package:nomowear/features/orders/data/pending_refund_store.dart';
 import 'package:nomowear/features/orders/data/pending_return_store.dart';
 import 'package:nomowear/features/orders/data/user_order_mapper.dart';
 
@@ -23,6 +24,7 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
 
   bool _isLoading = true;
   String? _errorMessage;
+  final Set<String> _refundTrackingOrderIds = <String>{};
 
   @override
   void initState() {
@@ -30,7 +32,9 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
     if (userOrdersList.isNotEmpty) {
       _isLoading = false;
       // Re-apply waitlisted return flags against any cached list.
-      PendingReturnStore.instance.ensureLoaded().then((_) {
+      PendingReturnStore.instance.ensureLoaded().then((_) async {
+        if (!mounted) return;
+        await _resolveRefundTracking(userOrdersList);
         if (!mounted) return;
         setState(() {});
         _loadOrders(forceRefresh: true);
@@ -63,13 +67,14 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
 
     try {
       await PendingReturnStore.instance.ensureLoaded();
+      await PendingRefundStore.instance.ensureLoaded();
       final history = await _orderRepository.getOrderHistory(
         forceRefresh: forceRefresh,
       );
       final customer = await _profileRepository.getProfile();
-      replaceUserOrders(
-        UserOrderMapper.fromHistory(history, customer: customer),
-      );
+      final orders = UserOrderMapper.fromHistory(history, customer: customer);
+      replaceUserOrders(orders);
+      await _resolveRefundTracking(orders);
       if (mounted) {
         setState(() => _isLoading = false);
       }
@@ -88,6 +93,31 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
         });
       }
     }
+  }
+
+  Future<void> _resolveRefundTracking(List<UserOrder> orders) async {
+    await PendingRefundStore.instance.ensureLoaded();
+    final tracking = <String>{};
+    await Future.wait(orders.map((order) async {
+      if (order.isRefundCompleted) return;
+      final stored = PendingRefundStore.instance.getWaitlistNumber(order.id);
+      final waitlist = order.waitlistNumber?.trim().isNotEmpty == true
+          ? order.waitlistNumber!.trim()
+          : stored;
+      if (waitlist == null || waitlist.isEmpty) return;
+      try {
+        final status = await _orderRepository.getRefundStatus(waitlist);
+        if (!status.isRejected) tracking.add(order.id);
+      } catch (_) {
+        tracking.add(order.id);
+      }
+    }));
+    if (!mounted) return;
+    setState(() {
+      _refundTrackingOrderIds
+        ..clear()
+        ..addAll(tracking);
+    });
   }
 
   List<UserOrder> get _filtered {
@@ -219,6 +249,8 @@ class _MyOrdersScreenState extends State<MyOrdersScreen> {
                                 separatorBuilder: (_, __) => SizedBox(height: 16.h),
                                 itemBuilder: (context, i) => _OrderListTile(
                                   order: list[i],
+                                  refundTracking:
+                                      _refundTrackingOrderIds.contains(list[i].id),
                                   onReturnSubmitted: _refreshAfterReturn,
                                 ),
                               ),
@@ -307,10 +339,12 @@ class _EscalationWarningBanner extends StatelessWidget {
 
 class _OrderListTile extends StatelessWidget {
   final UserOrder order;
+  final bool refundTracking;
   final Future<void> Function()? onReturnSubmitted;
 
   const _OrderListTile({
     required this.order,
+    this.refundTracking = false,
     this.onReturnSubmitted,
   });
 
@@ -349,6 +383,12 @@ class _OrderListTile extends StatelessWidget {
     );
   }
 
+  bool get _showsReturnStatus =>
+      order.statusLabel == 'Return status' ||
+      order.isReturnEscalated ||
+      order.isReturnFailed ||
+      order.isReturnReattemptPending;
+
   Widget _buildWardrobeKitInfo(BuildContext context) {
     final orderIdFormatted = order.orderIdDisplay.startsWith('#')
         ? order.orderIdDisplay
@@ -363,28 +403,36 @@ class _OrderListTile extends StatelessWidget {
         ? order.deliveryDateFormatted!
         : order.statusDate;
 
+    final isReturnComplete = order.isReturnComplete;
+    final isReorderRequested = order.isReorderRequested;
     final isDeliveryReattempt = order.isDeliveryReattemptEligible;
     final isReturnPending = order.isReturnReattemptPending;
     final isReturnFailed = order.isReturnFailed;
     final isEscalated = order.isReturnEscalated;
 
-    final statusText = isEscalated
-        ? '⚠️ Return Escalated'
-        : isReturnFailed
-            ? 'Return Failed'
-            : isReturnPending
-                ? 'Reschedule In Progress'
-                : isDeliveryReattempt
-                    ? 'Delivery Failed'
-                    : deliveryDateText;
+    final statusText = isReturnComplete
+        ? 'Completed'
+        : isEscalated
+            ? '⚠️ Return Escalated'
+            : isReorderRequested
+                ? 'Reorder Requested'
+                : isReturnFailed
+                ? 'Return Failed'
+                : isReturnPending
+                    ? 'Reschedule In Progress'
+                    : isDeliveryReattempt
+                        ? 'Delivery Failed'
+                        : deliveryDateText;
 
-    final statusColor = isEscalated || isReturnFailed
-        ? const Color(0xFFF87171)
-        : isReturnPending
-            ? const Color(0xFFFBBF24)
-            : isDeliveryReattempt
-                ? const Color(0xFFE6C27A)
-                : Colors.white;
+    final statusColor = isReturnComplete
+        ? const Color(0xFF34D399)
+        : isEscalated || isReturnFailed
+            ? const Color(0xFFF87171)
+            : isReorderRequested || isReturnPending
+                ? const Color(0xFFFBBF24)
+                : isDeliveryReattempt
+                    ? const Color(0xFFE6C27A)
+                    : Colors.white;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -438,6 +486,7 @@ class _OrderListTile extends StatelessWidget {
         SizedBox(height: 4.h),
 
         /// STATUS LINE
+        if (!_showsReturnStatus)
         RichText(
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
@@ -455,7 +504,7 @@ class _OrderListTile extends StatelessWidget {
                 style: CustomTextStyles.montserratSemiBold.copyWith(
                   fontSize: 12.fSize,
                   color: statusColor,
-                  fontWeight: isEscalated || isReturnFailed || isReturnPending || isDeliveryReattempt
+                  fontWeight: isEscalated || isReturnFailed || isReturnPending || isReorderRequested || isDeliveryReattempt
                       ? FontWeight.bold
                       : FontWeight.w600,
                 ),
@@ -464,156 +513,212 @@ class _OrderListTile extends StatelessWidget {
           ),
         ),
 
-        SizedBox(height: 10.h),
+        if (!isReturnComplete) ...[
+          SizedBox(height: 10.h),
 
-        /// ACTION BUTTON
-        SizedBox(
-          width: double.infinity,
-          height: 38.h,
-          child: isDeliveryReattempt
-              ? ElevatedButton(
-                  onPressed: () => Navigator.pushNamed(
-                    context,
-                    AppRoutes.orderDetailsScreen,
-                    arguments: order.id,
-                  ).then((_) => onReturnSubmitted?.call()),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFD8B26A),
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    padding: EdgeInsets.zero,
-                  ),
-                  child: Text(
-                    'Schedule Delivery Reattempt',
-                    style: TextStyle(
-                      fontSize: 11.5.fSize,
-                      color: Colors.black,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                )
-              : isReturnPending
-                  ? OutlinedButton(
-                      onPressed: null,
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(
-                          color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
-                          width: 1,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        padding: EdgeInsets.zero,
+          /// ACTION BUTTON
+          SizedBox(
+            width: double.infinity,
+            height: 38.h,
+            child: order.isRefundCompleted
+                ? OutlinedButton(
+                    onPressed: null,
+                    style: OutlinedButton.styleFrom(
+                      side: BorderSide(
+                        color: AppColours.primary.withOpacity(0.45),
+                        width: 1,
                       ),
-                      child: Text(
-                        'Pickup Reschedule In Progress',
-                        style: TextStyle(
-                          fontSize: 11.fSize,
-                          color: const Color(0xFFF59E0B),
-                          fontWeight: FontWeight.w600,
-                        ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
                       ),
-                    )
-                  : isReturnFailed
-                      ? ElevatedButton(
-                          onPressed: () => Navigator.pushNamed(
-                            context,
-                            AppRoutes.orderDetailsScreen,
-                            arguments: order.id,
-                          ).then((_) => onReturnSubmitted?.call()),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFD8B26A),
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            padding: EdgeInsets.zero,
+                      padding: EdgeInsets.zero,
+                    ),
+                    child: Text(
+                      'Completed',
+                      style: TextStyle(
+                        fontSize: 11.5.fSize,
+                        color: Colors.white54,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                : refundTracking
+                ? ElevatedButton(
+                    onPressed: () => Navigator.pushNamed(
+                      context,
+                      AppRoutes.orderTrackingScreen,
+                      arguments: order.id,
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFD8B26A),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      padding: EdgeInsets.zero,
+                    ),
+                    child: Text(
+                      'Refund Tracking',
+                      style: TextStyle(
+                        fontSize: 11.5.fSize,
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                : isDeliveryReattempt
+                ? ElevatedButton(
+                    onPressed: () => Navigator.pushNamed(
+                      context,
+                      AppRoutes.orderDetailsScreen,
+                      arguments: order.id,
+                    ).then((_) => onReturnSubmitted?.call()),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFD8B26A),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      padding: EdgeInsets.zero,
+                    ),
+                    child: Text(
+                      'Schedule Delivery Reattempt',
+                      style: TextStyle(
+                        fontSize: 11.5.fSize,
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                : isReturnPending
+                    ? OutlinedButton(
+                        onPressed: null,
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                            color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
+                            width: 1,
                           ),
-                          child: Text(
-                            '⇪ Reattempt Pickup',
-                            style: TextStyle(
-                              fontSize: 12.fSize,
-                              color: Colors.black,
-                              fontWeight: FontWeight.bold,
-                            ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
                           ),
-                        )
-                      : OutlinedButton(
-                          onPressed: () async {
-                            if (!order.canReturn) {
-                              Navigator.pushNamed(
-                                context,
-                                AppRoutes.orderTrackingScreen,
-                                arguments: order.id,
-                              );
-                              return;
-                            }
-                            final submitted = await Navigator.pushNamed(
+                          padding: EdgeInsets.zero,
+                        ),
+                        child: Text(
+                          'Pickup Reschedule In Progress',
+                          style: TextStyle(
+                            fontSize: 11.fSize,
+                            color: const Color(0xFFF59E0B),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      )
+                    : isReturnFailed
+                        ? ElevatedButton(
+                            onPressed: () => Navigator.pushNamed(
                               context,
-                              AppRoutes.returnOrderScreen,
-                              arguments: {
-                                'orderId': order.id,
-                                'orderNumber': order.orderIdDisplay,
-                              },
-                            );
-                            if (submitted == true && context.mounted) {
-                              await onReturnSubmitted?.call();
-                              if (!context.mounted) return;
-                              Navigator.pushNamed(
+                              AppRoutes.orderDetailsScreen,
+                              arguments: order.id,
+                            ).then((_) => onReturnSubmitted?.call()),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFD8B26A),
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              padding: EdgeInsets.zero,
+                            ),
+                            child: Text(
+                              '⇪ Reattempt Pickup',
+                              style: TextStyle(
+                                fontSize: 12.fSize,
+                                color: Colors.black,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          )
+                        : OutlinedButton(
+                            onPressed: () async {
+                              if (!order.canReturn) {
+                                Navigator.pushNamed(
+                                  context,
+                                  AppRoutes.orderTrackingScreen,
+                                  arguments: order.id,
+                                );
+                                return;
+                              }
+                              final submitted = await Navigator.pushNamed(
                                 context,
-                                AppRoutes.orderTrackingScreen,
-                                arguments: order.id,
+                                AppRoutes.returnOrderScreen,
+                                arguments: {
+                                  'orderId': order.id,
+                                  'orderNumber': order.orderIdDisplay,
+                                },
                               );
-                            }
-                          },
-                          style: OutlinedButton.styleFrom(
-                            side: BorderSide(
-                              color: AppColours.primary.withOpacity(0.45),
-                              width: 1,
+                              if (submitted == true && context.mounted) {
+                                await onReturnSubmitted?.call();
+                                if (!context.mounted) return;
+                                Navigator.pushNamed(
+                                  context,
+                                  AppRoutes.orderTrackingScreen,
+                                  arguments: order.id,
+                                );
+                              }
+                            },
+                            style: OutlinedButton.styleFrom(
+                              side: BorderSide(
+                                color: AppColours.primary.withOpacity(0.45),
+                                width: 1,
+                              ),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              padding: EdgeInsets.zero,
                             ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
+                            child: Text(
+                              order.actionLabel,
+                              style: CustomTextStyles.openSansSemiBold.copyWith(
+                                fontSize: 11.fSize,
+                                color: Colors.white,
+                              ),
                             ),
-                            padding: EdgeInsets.zero,
                           ),
-                          child: Text(
-                            order.actionLabel,
-                            style: CustomTextStyles.openSansSemiBold.copyWith(
-                              fontSize: 11.fSize,
-                              color: Colors.white,
-                            ),
-                          ),
-                        ),
-        ),
+          ),
+        ],
       ],
     );
   }
 
   Widget _buildNormalOrderInfo(BuildContext context) {
+    final isReturnComplete = order.isReturnComplete;
+    final isReorderRequested = order.isReorderRequested;
     final isDeliveryReattempt = order.isDeliveryReattemptEligible;
     final isReturnPending = order.isReturnReattemptPending;
     final isReturnFailed = order.isReturnFailed;
     final isEscalated = order.isReturnEscalated;
 
-    final statusText = isEscalated
-        ? '⚠️ Return Escalated'
-        : isReturnFailed
-            ? 'Return Failed'
-            : isReturnPending
-                ? 'Reschedule In Progress'
-                : isDeliveryReattempt
-                    ? 'Delivery Failed'
-                    : order.statusDate;
+    final statusText = isReturnComplete
+        ? 'Completed'
+        : isEscalated
+            ? '⚠️ Return Escalated'
+            : isReorderRequested
+                ? 'Reorder Requested'
+                : isReturnFailed
+                ? 'Return Failed'
+                : isReturnPending
+                    ? 'Reschedule In Progress'
+                    : isDeliveryReattempt
+                        ? 'Delivery Failed'
+                        : order.statusDate;
 
-    final statusColor = isEscalated || isReturnFailed
-        ? const Color(0xFFF87171)
-        : isReturnPending
-            ? const Color(0xFFFBBF24)
-            : isDeliveryReattempt
-                ? const Color(0xFFE6C27A)
-                : Colors.white;
+    final statusColor = isReturnComplete
+        ? const Color(0xFF34D399)
+        : isEscalated || isReturnFailed
+            ? const Color(0xFFF87171)
+            : isReorderRequested || isReturnPending
+                ? const Color(0xFFFBBF24)
+                : isDeliveryReattempt
+                    ? const Color(0xFFE6C27A)
+                    : Colors.white;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -669,6 +774,7 @@ class _OrderListTile extends StatelessWidget {
         SizedBox(height: 4.h),
 
         /// STATUS LINE
+        if (!_showsReturnStatus)
         RichText(
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
@@ -686,7 +792,7 @@ class _OrderListTile extends StatelessWidget {
                 style: CustomTextStyles.montserratSemiBold.copyWith(
                   fontSize: 12.fSize,
                   color: statusColor,
-                  fontWeight: isEscalated || isReturnFailed || isReturnPending || isDeliveryReattempt
+                  fontWeight: isEscalated || isReturnFailed || isReturnPending || isReorderRequested || isDeliveryReattempt
                       ? FontWeight.bold
                       : FontWeight.w600,
                 ),
@@ -695,145 +801,188 @@ class _OrderListTile extends StatelessWidget {
           ),
         ),
 
-        SizedBox(height: 12.h),
+        if (!isReturnComplete) ...[
+          SizedBox(height: 12.h),
 
-        /// BUTTON
-        SizedBox(
-          width: double.infinity,
-          height: 42.h,
-          child: isDeliveryReattempt
-              ? ElevatedButton(
-                  onPressed: () => Navigator.pushNamed(
-                    context,
-                    AppRoutes.orderDetailsScreen,
-                    arguments: order.id,
-                  ).then((_) => onReturnSubmitted?.call()),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFD8B26A),
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                  ),
-                  child: Text(
-                    'Schedule Delivery Reattempt',
-                    style: TextStyle(
-                      fontSize: 12.fSize,
-                      color: Colors.black,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                )
-              : isReturnPending
-                  ? OutlinedButton(
-                      onPressed: null,
-                      style: OutlinedButton.styleFrom(
-                        side: BorderSide(
-                          color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
-                          width: 1,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+          /// BUTTON
+          SizedBox(
+            width: double.infinity,
+            height: 42.h,
+            child: order.isRefundCompleted
+                ? OutlinedButton(
+                    onPressed: null,
+                    style: OutlinedButton.styleFrom(
+                      side: const BorderSide(color: Color(0x66E6C27A)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
                       ),
-                      child: Text(
-                        'Pickup Reschedule In Progress',
-                        style: TextStyle(
-                          fontSize: 11.fSize,
-                          color: const Color(0xFFF59E0B),
-                          fontWeight: FontWeight.w600,
-                        ),
+                    ),
+                    child: Text(
+                      'Completed',
+                      style: TextStyle(
+                        fontSize: 12.fSize,
+                        color: Colors.white54,
+                        fontWeight: FontWeight.bold,
                       ),
-                    )
-                  : isReturnFailed
-                      ? ElevatedButton(
-                          onPressed: () => Navigator.pushNamed(
-                            context,
-                            AppRoutes.orderDetailsScreen,
-                            arguments: order.id,
-                          ).then((_) => onReturnSubmitted?.call()),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFD8B26A),
-                            elevation: 0,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
+                    ),
+                  )
+                : refundTracking
+                ? ElevatedButton(
+                    onPressed: () => Navigator.pushNamed(
+                      context,
+                      AppRoutes.orderTrackingScreen,
+                      arguments: order.id,
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFD8B26A),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: Text(
+                      'Refund Tracking',
+                      style: TextStyle(
+                        fontSize: 12.fSize,
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                : isDeliveryReattempt
+                ? ElevatedButton(
+                    onPressed: () => Navigator.pushNamed(
+                      context,
+                      AppRoutes.orderDetailsScreen,
+                      arguments: order.id,
+                    ).then((_) => onReturnSubmitted?.call()),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFFD8B26A),
+                      elevation: 0,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: Text(
+                      'Schedule Delivery Reattempt',
+                      style: TextStyle(
+                        fontSize: 12.fSize,
+                        color: Colors.black,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  )
+                : isReturnPending
+                    ? OutlinedButton(
+                        onPressed: null,
+                        style: OutlinedButton.styleFrom(
+                          side: BorderSide(
+                            color: const Color(0xFFF59E0B).withValues(alpha: 0.5),
+                            width: 1,
                           ),
-                          child: Text(
-                            '⇪ Reattempt Pickup',
-                            style: TextStyle(
-                              fontSize: 12.fSize,
-                              color: Colors.black,
-                              fontWeight: FontWeight.bold,
-                            ),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
                           ),
-                        )
-                      : order.canReturn
-                          ? ElevatedButton(
-                              onPressed: () async {
-                                final submitted = await Navigator.pushNamed(
-                                  context,
-                                  AppRoutes.returnOrderScreen,
-                                  arguments: {
-                                    'orderId': order.id,
-                                    'orderNumber': order.orderIdDisplay,
-                                  },
-                                );
-                                if (submitted == true && context.mounted) {
-                                  await onReturnSubmitted?.call();
-                                  if (!context.mounted) return;
-                                  Navigator.pushNamed(
+                        ),
+                        child: Text(
+                          'Pickup Reschedule In Progress',
+                          style: TextStyle(
+                            fontSize: 11.fSize,
+                            color: const Color(0xFFF59E0B),
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      )
+                    : isReturnFailed
+                        ? ElevatedButton(
+                            onPressed: () => Navigator.pushNamed(
+                              context,
+                              AppRoutes.orderDetailsScreen,
+                              arguments: order.id,
+                            ).then((_) => onReturnSubmitted?.call()),
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: const Color(0xFFD8B26A),
+                              elevation: 0,
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                            ),
+                            child: Text(
+                              '⇪ Reattempt Pickup',
+                              style: TextStyle(
+                                fontSize: 12.fSize,
+                                color: Colors.black,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          )
+                        : order.canReturn
+                            ? ElevatedButton(
+                                onPressed: () async {
+                                  final submitted = await Navigator.pushNamed(
                                     context,
-                                    AppRoutes.orderTrackingScreen,
-                                    arguments: order.id,
+                                    AppRoutes.returnOrderScreen,
+                                    arguments: {
+                                      'orderId': order.id,
+                                      'orderNumber': order.orderIdDisplay,
+                                    },
                                   );
-                                }
-                              },
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: const Color(0xFFD8B26A),
-                                elevation: 0,
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
+                                  if (submitted == true && context.mounted) {
+                                    await onReturnSubmitted?.call();
+                                    if (!context.mounted) return;
+                                    Navigator.pushNamed(
+                                      context,
+                                      AppRoutes.orderTrackingScreen,
+                                      arguments: order.id,
+                                    );
+                                  }
+                                },
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFFD8B26A),
+                                  elevation: 0,
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
                                 ),
-                              ),
-                              child: Text(
-                                order.actionLabel,
-                                style: TextStyle(
-                                  color: Colors.black,
-                                  fontSize: 13.fSize,
-                                  fontWeight: FontWeight.w700,
+                                child: Text(
+                                  order.actionLabel,
+                                  style: TextStyle(
+                                    color: Colors.black,
+                                    fontSize: 13.fSize,
+                                    fontWeight: FontWeight.w700,
+                                  ),
                                 ),
-                              ),
-                            )
-                          : !order.isDelivered || order.isInReturnFlow
-                              ? OutlinedButton(
-                                  onPressed: () => Navigator.pushNamed(
-                                    context,
-                                    AppRoutes.orderTrackingScreen,
-                                    arguments: order.id,
-                                  ),
-                                  style: OutlinedButton.styleFrom(
-                                    side: BorderSide(
-                                      color: order.isInReturnFlow
-                                          ? const Color(0xFFD8B26A)
-                                          : const Color(0x66E6C27A),
+                              )
+                            : !order.isDelivered || order.isInReturnFlow
+                                ? OutlinedButton(
+                                    onPressed: () => Navigator.pushNamed(
+                                      context,
+                                      AppRoutes.orderTrackingScreen,
+                                      arguments: order.id,
                                     ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(12),
+                                    style: OutlinedButton.styleFrom(
+                                      side: BorderSide(
+                                        color: order.isInReturnFlow
+                                            ? const Color(0xFFD8B26A)
+                                            : const Color(0x66E6C27A),
+                                      ),
+                                      shape: RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
                                     ),
-                                  ),
-                                  child: Text(
-                                    order.actionLabel,
-                                    style: CustomTextStyles.openSansSemiBold.copyWith(
-                                      fontSize: 10,
-                                      color: order.isInReturnFlow
-                                          ? Colors.white
-                                          : AppColours.secondary,
+                                    child: Text(
+                                      order.actionLabel,
+                                      style: CustomTextStyles.openSansSemiBold.copyWith(
+                                        fontSize: 10,
+                                        color: order.isInReturnFlow
+                                            ? Colors.white
+                                            : AppColours.secondary,
+                                      ),
                                     ),
-                                  ),
-                                )
-                              : const SizedBox.shrink(),
-        ),
+                                  )
+                                : const SizedBox.shrink(),
+          ),
+        ],
       ],
     );
   }

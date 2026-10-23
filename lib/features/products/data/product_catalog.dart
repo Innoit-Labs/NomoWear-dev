@@ -9,7 +9,7 @@ class ProductCatalog {
     'Professional wardrobe',
     'Premium wardrobe',
     'Kids Wardrobe',
-    'Essentialswardrobe',
+    'Essentials Wardrobe',
   ];
 
   /// Non-essentials tabs used for category-lock matching only — not card inventory.
@@ -78,7 +78,7 @@ class ProductCatalog {
       if (needle == tab.toLowerCase()) return tab;
     }
 
-    // "Kids Essentials" / any essentials label must map to Essentialswardrobe,
+    // "Kids Essentials" / any essentials label must map to Essentials Wardrobe,
     // not Kidswardrobe (which also matches the substring "kids").
     if (needle.contains('essential')) {
       for (final tab in wardrobeApiTabs) {

@@ -57,6 +57,7 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
   final RazorpayService _razorpayService = RazorpayService();
 
   bool _isPlacingOrder = false;
+  bool _isConfirmingPayment = false;
   bool _wardrobeGarmentsExpanded = false;
 
   bool _hasOpenedPayment = false;
@@ -136,7 +137,10 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       return;
     }
 
-    setState(() => _isPlacingOrder = true);
+    setState(() {
+      _isPlacingOrder = true;
+      _isConfirmingPayment = true;
+    });
 
     try {
       final verified = await _orderRepository.verifyPayment(
@@ -151,11 +155,17 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       );
     } on ApiException catch (e) {
       if (!mounted) return;
-      setState(() => _isPlacingOrder = false);
+      setState(() {
+        _isPlacingOrder = false;
+        _isConfirmingPayment = false;
+      });
       CustomAppSnackBar.showError(context, e.message);
     } catch (_) {
       if (!mounted) return;
-      setState(() => _isPlacingOrder = false);
+      setState(() {
+        _isPlacingOrder = false;
+        _isConfirmingPayment = false;
+      });
       CustomAppSnackBar.showError(
         context,
         'Unable to verify payment. Please try again.',
@@ -516,14 +526,21 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       final disc = state.remote.discountAmount.round();
       final gst = state.remote.taxAmount.round();
       final tot = state.remote.totalAmount.round();
+      final depositFromCart = state.remote.securityDepositAmount.round();
+      final baseWithoutDeposit = sub + del + gst - disc;
+      final computedDeposit =
+          tot > baseWithoutDeposit ? (tot - baseWithoutDeposit) : 0;
+      final effectiveDeposit =
+          depositFromCart > 0 ? depositFromCart : computedDeposit;
       return OrderSummary(
         subtotal: sub,
         deliveryFee: del,
         discountAmount: disc,
         gst: gst,
-        total: tot > 0 ? tot : (sub + del + gst - disc),
+        total: tot > 0 ? tot : (baseWithoutDeposit + effectiveDeposit),
         wardrobeKitAmount: 0,
         essentialsAmount: 0,
+        securityDepositAmount: effectiveDeposit,
       );
     }
     return snapshot?.summary;
@@ -754,11 +771,12 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
         final summary = _displaySummary(state);
 
         return PopScope(
-          canPop: !_hasOpenedPayment ||
-              _activePendingOrderId == null ||
-              _activePendingOrderId!.isEmpty,
+          canPop: !_isConfirmingPayment &&
+              (!_hasOpenedPayment ||
+                  _activePendingOrderId == null ||
+                  _activePendingOrderId!.isEmpty),
           onPopInvokedWithResult: (didPop, result) {
-            if (didPop) return;
+            if (didPop || _isConfirmingPayment) return;
             if (_hasOpenedPayment &&
                 _activePendingOrderId != null &&
                 _activePendingOrderId!.isNotEmpty) {
@@ -818,6 +836,15 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
                                 gst: summary?.gst ?? 0,
                                 total: summary?.total ?? 0,
                                 wardrobeKitAmount: summary?.wardrobeKitAmount ?? 0,
+                                kitAmount: _kitOnlyAmount(
+                                  state,
+                                  summarySubtotal: summary?.subtotal ?? 0,
+                                ),
+                                kidsAmount: _sectionAmount(state.kidsItems),
+                                essentialsAmount:
+                                    _sectionAmount(state.essentialsOnlyItems),
+                                securityDepositAmount:
+                                    summary?.securityDepositAmount ?? 0,
                                 subscriptionBooking: subscriptionBooking,
                                 kitTitle: state.wardrobeKitTitle,
                                 hasWardrobeKit: state.wardrobeItems.isNotEmpty,
@@ -843,6 +870,7 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
                   ),
                 ),
               ),
+              if (_isConfirmingPayment) const _PaymentConfirmOverlay(),
             ],
           ),
         ),
@@ -1404,6 +1432,41 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     );
   }
 
+  int _sectionAmount(List<CartItem> items) {
+    return items.fold<int>(
+      0,
+      (sum, item) =>
+          sum +
+          (CheckoutPricing.parseItemPrice(
+                item.price,
+                isEssential: item.isEssential,
+              ) *
+              item.quantity),
+    );
+  }
+
+  int _kitOnlyAmount(CartState state, {required int summarySubtotal}) {
+    if (_isSubscriptionWardrobeBooking(state) || state.wardrobeItems.isEmpty) {
+      return 0;
+    }
+    var kitAmount = 0;
+    if (state.remote.activeKitPrice > 0) {
+      kitAmount = state.remote.activeKitPrice.round();
+    } else {
+      kitAmount = CheckoutPricing.wardrobeKitPriceFromState(state);
+    }
+    if (kitAmount <= 0) {
+      final extras =
+          _sectionAmount(state.kidsItems) + _sectionAmount(state.essentialsOnlyItems);
+      if (summarySubtotal > extras) {
+        kitAmount = summarySubtotal - extras;
+      } else {
+        kitAmount = _sectionAmount(state.wardrobeItems);
+      }
+    }
+    return kitAmount;
+  }
+
   Widget _buildOrderSummary({
     required int subtotal,
     required int deliveryFee,
@@ -1411,10 +1474,14 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
     required int gst,
     required int total,
     required int wardrobeKitAmount,
+    required int kitAmount,
+    required int kidsAmount,
+    required int essentialsAmount,
     required bool subscriptionBooking,
     required String kitTitle,
     required bool hasWardrobeKit,
     required bool isLoadingPayable,
+    int securityDepositAmount = 0,
     String? payableError,
   }) {
     return Column(
@@ -1455,8 +1522,28 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
         ] else if (payableError != null) ...[
           _addressAlert(payableError),
         ] else ...[
-          _summaryRow('Items Subtotal', CheckoutPricing.formatMoney(subtotal)),
-          SizedBox(height: 14.h),
+          if (hasWardrobeKit) ...[
+            _summaryRow(
+              'Kit Value',
+              CheckoutPricing.formatMoney(kitAmount),
+            ),
+            SizedBox(height: 14.h),
+          ],
+          if (kidsAmount > 0) ...[
+            _summaryRow('Kids', CheckoutPricing.formatMoney(kidsAmount)),
+            SizedBox(height: 14.h),
+          ],
+          if (essentialsAmount > 0) ...[
+            _summaryRow(
+              'Essentials',
+              CheckoutPricing.formatMoney(essentialsAmount),
+            ),
+            SizedBox(height: 14.h),
+          ],
+          if (!hasWardrobeKit && kidsAmount <= 0 && essentialsAmount <= 0) ...[
+            _summaryRow('Subtotal', CheckoutPricing.formatMoney(subtotal)),
+            SizedBox(height: 14.h),
+          ],
           _summaryRow(
             'Delivery Fee',
             deliveryFee > 0 ? CheckoutPricing.formatMoney(deliveryFee) : '₹0',
@@ -1471,6 +1558,13 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
           ],
           SizedBox(height: 14.h),
           _summaryRow('Taxes (GST 18%)', CheckoutPricing.formatMoney(gst)),
+          if (securityDepositAmount > 0) ...[
+            SizedBox(height: 14.h),
+            _summaryRow(
+              'Pre-Authorization (Refundable)',
+              CheckoutPricing.formatMoney(securityDepositAmount),
+            ),
+          ],
           SizedBox(height: 16.h),
           Divider(color: Colors.white.withOpacity(0.15), height: 1),
           SizedBox(height: 18.h),
@@ -1495,18 +1589,21 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
       crossAxisAlignment: CrossAxisAlignment.baseline,
       textBaseline: TextBaseline.alphabetic,
       children: [
-        Text(
-          title,
-          style: highlight
-              ? CustomTextStyles.montserratBold.copyWith(
-                  fontSize: 16.fSize,
-                  color: AppColours.primary,
-                )
-              : CustomTextStyles.openSansRegular.copyWith(
-                  fontSize: 14.fSize,
-                  color: AppColours.secondary.withOpacity(0.85),
-                ),
+        Expanded(
+          child: Text(
+            title,
+            style: highlight
+                ? CustomTextStyles.montserratBold.copyWith(
+                    fontSize: 16.fSize,
+                    color: AppColours.primary,
+                  )
+                : CustomTextStyles.openSansRegular.copyWith(
+                    fontSize: 14.fSize,
+                    color: AppColours.secondary.withOpacity(0.85),
+                  ),
+          ),
         ),
+        SizedBox(width: 8.w),
         Text(
           value,
           style: highlight
@@ -1629,6 +1726,125 @@ class _EssentialsCheckoutScreenState extends State<EssentialsCheckoutScreen> {
                   letterSpacing: 1.2,
                 ),
               ),
+      ),
+    );
+  }
+}
+
+class _PaymentConfirmOverlay extends StatefulWidget {
+  const _PaymentConfirmOverlay();
+
+  @override
+  State<_PaymentConfirmOverlay> createState() => _PaymentConfirmOverlayState();
+}
+
+class _PaymentConfirmOverlayState extends State<_PaymentConfirmOverlay>
+    with TickerProviderStateMixin {
+  late final AnimationController _ring;
+  late final AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _ring = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    )..repeat();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1100),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _ring.dispose();
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ColoredBox(
+      color: const Color(0xF20B0C10),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            SizedBox(
+              width: 148,
+              height: 148,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  AnimatedBuilder(
+                    animation: _pulse,
+                    builder: (context, _) {
+                      final scale = 0.82 + (_pulse.value * 0.18);
+                      return Transform.scale(
+                        scale: scale,
+                        child: Container(
+                          width: 96,
+                          height: 96,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: AppColours.primary.withValues(
+                              alpha: 0.16 - (_pulse.value * 0.1),
+                            ),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  RotationTransition(
+                    turns: _ring,
+                    child: SizedBox(
+                      width: 112,
+                      height: 112,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.6,
+                        color: AppColours.primary,
+                        backgroundColor:
+                            AppColours.primary.withValues(alpha: 0.16),
+                      ),
+                    ),
+                  ),
+                  ScaleTransition(
+                    scale: Tween<double>(begin: 0.92, end: 1).animate(
+                      CurvedAnimation(
+                        parent: _pulse,
+                        curve: Curves.easeInOut,
+                      ),
+                    ),
+                    child: Icon(
+                      Icons.shopping_bag_outlined,
+                      color: AppColours.primary,
+                      size: 38,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            SizedBox(height: 28.h),
+            Text(
+              'CONFIRMING PAYMENT',
+              style: TextStyle(
+                color: AppColours.primary,
+                fontSize: 14.fSize,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.6,
+              ),
+            ),
+            SizedBox(height: 10.h),
+            Text(
+              'Placing your order',
+              style: TextStyle(
+                color: Colors.white70,
+                fontSize: 14.fSize,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

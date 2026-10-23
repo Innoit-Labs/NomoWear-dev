@@ -254,7 +254,12 @@ class ApiClient {
       return _decodeResponse(response);
     } on ApiException {
       rethrow;
-    } catch (_) {
+    } catch (error) {
+      if (kDebugMode) {
+        debugPrint('──────── API Response ────────');
+        debugPrint('Error: $error');
+        debugPrint('────────────────────────────');
+      }
       throw const ApiException(
         'Unable to connect. Check your network and server.',
       );
@@ -262,6 +267,13 @@ class ApiClient {
   }
 
   Map<String, dynamic> _decodeResponse(http.Response response) {
+    if (kDebugMode) {
+      debugPrint('──────── API Response ────────');
+      debugPrint('Status: ${response.statusCode}');
+      debugPrint('Body: ${response.body}');
+      debugPrint('────────────────────────────');
+    }
+
     Map<String, dynamic> decoded;
     try {
       final raw = jsonDecode(response.body);
