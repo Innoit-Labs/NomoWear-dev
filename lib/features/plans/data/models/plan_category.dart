@@ -20,7 +20,7 @@ class PlanCategory {
   });
 
   factory PlanCategory.fromJson(Map<String, dynamic> json) {
-    final plansRaw = json['plans'];
+    final plansRaw = json['plans'] ?? json['wardrobePlans'] ?? json['items'];
     final plans = <WardrobePlan>[];
     if (plansRaw is List) {
       for (final item in plansRaw) {
@@ -32,13 +32,30 @@ class PlanCategory {
 
     plans.sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
 
+    final id = json['id']?.toString() ??
+        json['_id']?.toString() ??
+        json['categoryId']?.toString() ??
+        json['category_id']?.toString() ??
+        '';
+
+    final name = json['name']?.toString() ??
+        json['categoryName']?.toString() ??
+        json['category_name']?.toString() ??
+        '';
+
+    final activeVal = json['isActive'] ??
+        json['is_active'] ??
+        (json['status'] != null
+            ? json['status'].toString().toUpperCase() == 'ACTIVE'
+            : true);
+
     return PlanCategory(
-      id: json['id']?.toString() ?? '',
-      name: json['name']?.toString() ?? '',
+      id: id,
+      name: name,
       description: _nonEmpty(json['description']),
       displayOrder:
           _parseInt(json['displayOrder'] ?? json['display_order']) ?? 0,
-      isActive: _parseBool(json['isActive'] ?? json['is_active'] ?? true),
+      isActive: _parseBool(activeVal),
       features: (json['features'] as List?)?.map((e) => e.toString()).toList() ??
           [],
       plans: plans.where((p) => p.isActive && p.id.isNotEmpty).toList(),

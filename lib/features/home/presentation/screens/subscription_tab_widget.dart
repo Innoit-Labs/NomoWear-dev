@@ -19,6 +19,12 @@ class _SubscriptionTabWidgetState extends State<SubscriptionTabWidget> {
   bool _showSubscriptionPlans = false;
   PlanCategory? _selectedPlanCategory;
 
+  @override
+  void initState() {
+    super.initState();
+    debugPrint('[SUBSCRIPTION TAB] Tab opened -> initializing...');
+  }
+
   void _reloadSubscription({bool forceRefresh = false}) {
     context.read<SubscriptionBloc>().add(
           LoadActiveSubscriptionEvent(forceRefresh: forceRefresh),
@@ -31,19 +37,36 @@ class _SubscriptionTabWidgetState extends State<SubscriptionTabWidget> {
       listenWhen: (previous, current) =>
           current.bottomNavIndex == SubscriptionTabWidget.subscriptionTabIndex &&
           previous.bottomNavIndex != current.bottomNavIndex,
-      listener: (_, __) => _reloadSubscription(),
+      listener: (_, __) {
+        debugPrint('[SUBSCRIPTION TAB] Switched to Subscription tab');
+        _reloadSubscription();
+      },
       child: BlocConsumer<SubscriptionBloc, SubscriptionState>(
         listener: (context, state) {
           if (state is SubscriptionError) {
+            debugPrint('[SUBSCRIPTION TAB] Error: ${state.message}');
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(content: Text(state.message)),
             );
           }
           if (state is SubscriptionActive) {
+            debugPrint('================ [ACTIVE SUBSCRIPTION DATA] ================');
+            debugPrint('Subscription ID: ${state.subscription.id}');
+            debugPrint('Plan Name: ${state.subscription.planName}');
+            debugPrint('Plan Status: ${state.subscription.planStatus} (isActive: ${state.subscription.isActive})');
+            debugPrint('Plan Price: ${state.subscription.planPrice} / ${state.subscription.billingPeriod}');
+            debugPrint('Valid Period: ${state.subscription.startDate} -> ${state.subscription.endDate}');
+            debugPrint('Bookings: ${state.subscription.bookingsUsed ?? 0}/${state.subscription.noOfBookings} (remaining: ${state.subscription.remainingBookings ?? 0})');
+            debugPrint('Garments: ${state.subscription.usedGarments ?? 0}/${state.subscription.maxGarments} (remaining: ${state.subscription.remainingGarments ?? 0})');
+            debugPrint('Details: ${state.subscription.toMap()}');
+            debugPrint('============================================================');
             setState(() {
               _showSubscriptionPlans = false;
               _selectedPlanCategory = null;
             });
+          }
+          if (state is SubscriptionInactive) {
+            debugPrint('[SUBSCRIPTION TAB] User currently has no active subscription.');
           }
         },
         builder: (context, state) {
@@ -54,6 +77,7 @@ class _SubscriptionTabWidgetState extends State<SubscriptionTabWidget> {
           if (state is SubscriptionActive) {
             return ActiveSubscriptionWidget(
               subscription: state.subscription,
+              onRefresh: () async => _reloadSubscription(forceRefresh: true),
             );
           }
 
@@ -80,6 +104,7 @@ class _SubscriptionTabWidgetState extends State<SubscriptionTabWidget> {
                 _showSubscriptionPlans = true;
               });
             },
+            onRefresh: () async => _reloadSubscription(forceRefresh: true),
           );
         },
       ),
@@ -107,47 +132,50 @@ class _SubscriptionTabWidgetState extends State<SubscriptionTabWidget> {
   }
 
   Widget _buildError(String message) {
-    return Container(
-      margin: EdgeInsets.fromLTRB(16.w, 0, 16.w, 16.h),
-      child: Column(
+    return RefreshIndicator(
+      color: AppColours.primary,
+      backgroundColor: const Color(0xFF16181D),
+      onRefresh: () async => _reloadSubscription(forceRefresh: true),
+      child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: EdgeInsets.fromLTRB(16.w, 0, 16.w, 16.h),
         children: [
           SizedBox(height: 12.h),
           Text(
             'Subscription',
+            textAlign: TextAlign.center,
             style: CustomTextStyles.openSansSemiBold.copyWith(
               fontSize: 16,
               color: AppColours.primary,
             ),
           ),
-          SizedBox(height: 24.h),
-          Expanded(
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    message,
-                    textAlign: TextAlign.center,
-                    style: CustomTextStyles.openSansRegular.copyWith(
-                      color: Colors.white70,
-                      fontSize: 14,
+          SizedBox(height: 120.h),
+          Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  message,
+                  textAlign: TextAlign.center,
+                  style: CustomTextStyles.openSansRegular.copyWith(
+                    color: Colors.white70,
+                    fontSize: 14,
+                  ),
+                ),
+                SizedBox(height: 16.h),
+                ElevatedButton(
+                  onPressed: () => _reloadSubscription(forceRefresh: true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppColours.primary,
+                  ),
+                  child: Text(
+                    'Retry',
+                    style: CustomTextStyles.openSansSemiBold.copyWith(
+                      color: Colors.black,
                     ),
                   ),
-                  SizedBox(height: 16.h),
-                  ElevatedButton(
-                    onPressed: () => _reloadSubscription(forceRefresh: true),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: AppColours.primary,
-                    ),
-                    child: Text(
-                      'Retry',
-                      style: CustomTextStyles.openSansSemiBold.copyWith(
-                        color: Colors.black,
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         ],

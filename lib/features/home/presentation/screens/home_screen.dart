@@ -498,6 +498,7 @@ class _HomeScreenState extends State<HomeScreen> {
             builder: (context, state) {
               return Scaffold(
                 backgroundColor: const Color(0xFF0F1012),
+                resizeToAvoidBottomInset: false,
                 body: SafeArea(
                   child: Column(
                     children: [

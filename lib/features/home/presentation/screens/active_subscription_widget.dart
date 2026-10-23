@@ -12,9 +12,11 @@ class ActiveSubscriptionWidget extends StatefulWidget {
   const ActiveSubscriptionWidget({
     super.key,
     required this.subscription,
+    this.onRefresh,
   });
 
   final ActiveSubscription subscription;
+  final Future<void> Function()? onRefresh;
 
   @override
   State<ActiveSubscriptionWidget> createState() =>
@@ -78,20 +80,20 @@ class _ActiveSubscriptionWidgetState extends State<ActiveSubscriptionWidget> {
       widget.subscription.billingPeriod.toLowerCase().contains('year');
 
   List<PlanCategory> get _upgradeCategories {
-    final result = <PlanCategory>[];
-    for (final category in _categories) {
-      if (_hasUpgradePlan(category)) result.add(category);
-    }
+    final result = <PlanCategory>[..._categories];
     result.sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
     return result;
   }
 
   bool _hasUpgradePlan(PlanCategory category) {
+    if (category.plans.isEmpty) return true;
     return category.plans.any((plan) => _planPrice(plan) > _currentPrice);
   }
 
-  num _planPrice(WardrobePlan plan) =>
-      _isYearly ? plan.yearPrice : plan.monthPrice;
+  num _planPrice(WardrobePlan plan) {
+    if (plan.price > 0) return plan.price;
+    return _isYearly ? plan.yearPrice : plan.monthPrice;
+  }
 
   List<String> _featuresForCategory(PlanCategory category) {
     if (category.features.isNotEmpty) {
@@ -132,57 +134,72 @@ class _ActiveSubscriptionWidgetState extends State<ActiveSubscriptionWidget> {
     return null;
   }
 
+  Future<void> _handleRefresh() async {
+    debugPrint('[ACTIVE SUBSCRIPTION] Pull to refresh triggered');
+    await Future.wait([
+      _refreshCategories(),
+      if (widget.onRefresh != null) widget.onRefresh!(),
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
     final upgradeCategories = _upgradeCategories;
-    final highlightCategoryId = upgradeCategories.isNotEmpty
-        ? upgradeCategories.last.id
-        : null;
+    final upgradeEligible = upgradeCategories.where(_hasUpgradePlan);
+    final highlightCategoryId = upgradeEligible.isNotEmpty
+        ? upgradeEligible.last.id
+        : (upgradeCategories.isNotEmpty ? upgradeCategories.last.id : null);
 
-    return SingleChildScrollView(
-      padding: EdgeInsets.fromLTRB(16.w, 0, 16.w, 24.h),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          SizedBox(height: 12.h),
-          Text(
-            'Subscription',
-            textAlign: TextAlign.center,
-            style: CustomTextStyles.openSansSemiBold.copyWith(
-              fontSize: 16,
-              color: AppColours.primary,
-            ),
-          ),
-          SizedBox(height: 8.h),
-          _headerDivider(),
-          SizedBox(height: 20.h),
-          SubscriptionPlanCard(
-            subscription: widget.subscription,
-            showCurrentPlanBadge: true,
-            matchedFeatures: _matchedCurrentPlanFeatures(),
-          ),
-          if (_isLoadingCategories) ...[
-            SizedBox(height: 24.h),
-            Center(
-              child: CircularProgressIndicator(
+    return RefreshIndicator(
+      color: AppColours.primary,
+      backgroundColor: const Color(0xFF16181D),
+      onRefresh: _handleRefresh,
+      child: SingleChildScrollView(
+        physics: const AlwaysScrollableScrollPhysics(),
+        padding: EdgeInsets.fromLTRB(16.w, 0, 16.w, 24.h),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            SizedBox(height: 12.h),
+            Text(
+              'Subscription',
+              textAlign: TextAlign.center,
+              style: CustomTextStyles.openSansSemiBold.copyWith(
+                fontSize: 16,
                 color: AppColours.primary,
-                strokeWidth: 2,
               ),
             ),
-          ] else ...[
-            ...upgradeCategories.map(
-              (category) => Padding(
-                padding: EdgeInsets.only(top: 16.h),
-                child: _UpgradeMembershipCard(
-                  category: category,
-                  features: _featuresForCategory(category),
-                  highlight: category.id == highlightCategoryId,
-                  onUpgrade: () => _openUpgradePlans(category),
+            SizedBox(height: 8.h),
+            _headerDivider(),
+            SizedBox(height: 20.h),
+            SubscriptionPlanCard(
+              subscription: widget.subscription,
+              showCurrentPlanBadge: true,
+              matchedFeatures: _matchedCurrentPlanFeatures(),
+            ),
+            if (_isLoadingCategories) ...[
+              SizedBox(height: 24.h),
+              Center(
+                child: CircularProgressIndicator(
+                  color: AppColours.primary,
+                  strokeWidth: 2,
                 ),
               ),
-            ),
+            ] else ...[
+              ...upgradeCategories.map(
+                (category) => Padding(
+                  padding: EdgeInsets.only(top: 16.h),
+                  child: _UpgradeMembershipCard(
+                    category: category,
+                    features: _featuresForCategory(category),
+                    highlight: category.id == highlightCategoryId,
+                    onUpgrade: () => _openUpgradePlans(category),
+                  ),
+                ),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }

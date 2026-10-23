@@ -101,17 +101,31 @@ class OrderActionResolver {
     bool pendingReturn = false,
     bool returnFailed = false,
     String? returnResolutionStatus,
+    String? resolutionStatus,
   }) {
     final status = orderStatus?.trim().toUpperCase() ?? '';
     final ret = returnStatus?.trim().toUpperCase() ?? '';
     final refund = refundStatus?.trim().toUpperCase() ?? '';
     final resStatus = returnResolutionStatus?.trim().toUpperCase() ?? '';
+    final deliveryResolution = resolutionStatus?.trim().toUpperCase() ?? '';
 
     if (status == 'CANCELLED') return OrderActionDecision.cancelled;
 
+    if (_returnSettled.contains(status) || _returnSettled.contains(ret)) {
+      return OrderActionDecision.completed;
+    }
+
+    final deliveredNow =
+        status == 'DELIVERED' || status == 'COMPLETED' || wasDelivered;
+
+    if (!deliveredNow &&
+        (deliveryResolution == 'REORDER_REQUESTED' ||
+            status == 'REORDER_REQUESTED')) {
+      return OrderActionDecision.trackOrder;
+    }
+
     final isDeliveryReattempt = status == 'NOT_DELIVERED' ||
-        status == 'DELIVERY_FAILED' ||
-        status == 'RETURNED_TO_IAP';
+        status == 'DELIVERY_FAILED';
     if (isDeliveryReattempt) return OrderActionDecision.reattemptDelivery;
 
     if (resStatus == 'RETURN_REATTEMPT_PENDING') {
@@ -142,8 +156,6 @@ class OrderActionResolver {
         refund == 'REFUNDED';
     if (wasDelivered && returnFinished) return OrderActionDecision.completed;
 
-    final deliveredNow =
-        status == 'DELIVERED' || status == 'COMPLETED' || wasDelivered;
     if (deliveredNow) {
       final inWindow = ret == 'ACTIVE' || (daysLeft != null && daysLeft > 0);
       if (inWindow) return OrderActionDecision.returnOrder;

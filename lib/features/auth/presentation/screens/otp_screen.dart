@@ -1,5 +1,7 @@
-import 'package:flutter/material.dart';
-import 'package:flutter_bloc/flutter_bloc.dart';
+import 'dart:async';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:smart_auth/smart_auth.dart';
 import 'package:nomowear/core/app_export.dart';
 import 'package:nomowear/features/auth/presentation/bloc/otp_bloc.dart';
 import 'package:nomowear/features/auth/presentation/bloc/otp_event.dart';
@@ -7,7 +9,7 @@ import 'package:nomowear/features/auth/presentation/bloc/otp_state.dart';
 import 'package:nomowear/features/auth/presentation/models/otp_screen_args.dart';
 
 class OtpScreen extends StatefulWidget {
-  const OtpScreen({Key? key}) : super(key: key);
+  const OtpScreen({super.key});
 
   @override
   State<OtpScreen> createState() => _OtpScreenState();
@@ -23,6 +25,10 @@ class _OtpScreenState extends State<OtpScreen> {
     (index) => FocusNode(),
   );
 
+  bool _isDisposed = false;
+  bool _isListening = false;
+  OtpBloc? _otpBloc;
+
   @override
   void initState() {
     super.initState();
@@ -32,10 +38,14 @@ class _OtpScreenState extends State<OtpScreen> {
         _focusNodes[0].requestFocus();
       }
     });
+    _startSmsListener();
   }
 
   @override
   void dispose() {
+    _isDisposed = true;
+    _stopSmsListener();
+    _otpBloc = null;
     for (var controller in _controllers) {
       controller.dispose();
     }
@@ -45,12 +55,82 @@ class _OtpScreenState extends State<OtpScreen> {
     super.dispose();
   }
 
+  Future<void> _stopSmsListener() async {
+    _isListening = false;
+    try {
+      await SmartAuth.instance.removeUserConsentApiListener();
+      await SmartAuth.instance.removeSmsRetrieverApiListener();
+    } catch (e) {
+      debugPrint('Error removing SMS listener: $e');
+    }
+  }
+
+  Future<void> _startSmsListener() async {
+    if (kIsWeb) return;
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+
+    await _stopSmsListener();
+    if (_isDisposed || !mounted) return;
+
+    _isListening = true;
+
+    if (kDebugMode) {
+      SmartAuth.instance.getAppSignature().then((sig) {
+        if (sig.hasData) {
+          debugPrint('SmartAuth App Signature: ${sig.requireData}');
+        }
+      });
+    }
+
+    try {
+      final res = await SmartAuth.instance.getSmsWithUserConsentApi(
+        matcher: r'\b\d{6}\b',
+      );
+
+      if (_isDisposed || !mounted || !_isListening) return;
+
+      if (res.hasData) {
+        final data = res.requireData;
+        String? code = data.code;
+        if (code == null || code.length != 6) {
+          final match = RegExp(r'\b\d{6}\b').firstMatch(data.sms);
+          if (match != null) {
+            code = match.group(0);
+          }
+        }
+
+        if (code != null && code.length == 6) {
+          _applyOtpAndVerify(code);
+        }
+      }
+    } catch (e) {
+      debugPrint('SMS User Consent error: $e');
+    }
+  }
+
+  void _applyOtpAndVerify(String code) {
+    if (_isDisposed || !mounted) return;
+
+    final cleanCode = code.replaceAll(RegExp(r'\D'), '');
+    if (cleanCode.length != 6) return;
+
+    for (int i = 0; i < 6; i++) {
+      _controllers[i].text = cleanCode[i];
+    }
+
+    FocusScope.of(context).unfocus();
+
+    _otpBloc?.add(OtpChangedEvent(cleanCode));
+    _otpBloc?.add(VerifyOtpEvent());
+  }
+
   void _clearControllers() {
     for (var controller in _controllers) {
       controller.clear();
     }
+    _otpBloc?.add(OtpChangedEvent(''));
     // Set focus back to the first text field
-    if (_focusNodes.isNotEmpty) {
+    if (_focusNodes.isNotEmpty && mounted) {
       _focusNodes[0].requestFocus();
     }
   }
@@ -80,12 +160,16 @@ class _OtpScreenState extends State<OtpScreen> {
     }
 
     return BlocProvider(
-      create: (context) => OtpBloc(
-        mobileNumber: args.mobileNumber,
-        customerId: args.customerId,
-        userToken: args.userToken,
-        initialOtp: args.otp,
-      ),
+      create: (context) {
+        final bloc = OtpBloc(
+          mobileNumber: args.mobileNumber,
+          customerId: args.customerId,
+          userToken: args.userToken,
+          initialOtp: args.otp,
+        );
+        _otpBloc = bloc;
+        return bloc;
+      },
       child: BlocListener<OtpBloc, OtpState>(
         listenWhen: (previous, current) =>
             !previous.isSuccess && current.isSuccess,
@@ -108,6 +192,7 @@ class _OtpScreenState extends State<OtpScreen> {
               ScaffoldMessenger.of(context).showSnackBar(
                 const SnackBar(content: Text('OTP resent successfully')),
               );
+              _startSmsListener();
             }
           },
           child: BlocBuilder<OtpBloc, OtpState>(
@@ -148,11 +233,13 @@ class _OtpScreenState extends State<OtpScreen> {
                       ],
                       SizedBox(height: 40.h),
                       // OTP Boxes Row
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: List.generate(
-                          6,
-                          (index) => _buildOtpBox(context, index, state),
+                      AutofillGroup(
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: List.generate(
+                            6,
+                            (index) => _buildOtpBox(context, index, state),
+                          ),
                         ),
                       ),
                       SizedBox(height: 15.h),
@@ -217,6 +304,7 @@ class _OtpScreenState extends State<OtpScreen> {
       onTap: state.secondsRemaining == 0
           ? () {
               _clearControllers();
+              _stopSmsListener();
               context.read<OtpBloc>().add(ResendOtpEvent());
             }
           : null,
@@ -315,21 +403,43 @@ class _OtpScreenState extends State<OtpScreen> {
       child: TextField(
         controller: _controllers[index],
         focusNode: _focusNodes[index],
+        autofillHints: const [AutofillHints.oneTimeCode],
+        maxLength: 1,
+        maxLengthEnforcement: MaxLengthEnforcement.none,
         onChanged: (value) {
+          if (value.length > 1) {
+            final digits = value.replaceAll(RegExp(r'\D'), '');
+            if (digits.length >= 6) {
+              _applyOtpAndVerify(digits.substring(0, 6));
+              return;
+            }
+            final lastChar = digits.isNotEmpty ? digits[digits.length - 1] : '';
+            _controllers[index].text = lastChar;
+            _controllers[index].selection =
+                TextSelection.collapsed(offset: lastChar.length);
+            if (lastChar.isNotEmpty && index < 5) {
+              _focusNodes[index + 1].requestFocus();
+            }
+          } else {
+            if (value.isNotEmpty && index < 5) {
+              _focusNodes[index + 1].requestFocus();
+            } else if (value.isEmpty && index > 0) {
+              _focusNodes[index - 1].requestFocus();
+            }
+          }
+
           String currentOtp = "";
           for (var controller in _controllers) {
             currentOtp += controller.text;
           }
-          context.read<OtpBloc>().add(OtpChangedEvent(currentOtp));
-          if (value.isNotEmpty && index < 5) {
-            _focusNodes[index + 1].requestFocus();
-          } else if (value.isEmpty && index > 0) {
-            _focusNodes[index - 1].requestFocus();
+          (_otpBloc ?? context.read<OtpBloc>()).add(OtpChangedEvent(currentOtp));
+
+          if (currentOtp.length == 6) {
+            (_otpBloc ?? context.read<OtpBloc>()).add(VerifyOtpEvent());
           }
         },
         textAlign: TextAlign.center,
         keyboardType: TextInputType.number,
-        maxLength: 1,
         style: TextStyle(
           color: state.hasError ? Colors.red : AppColours.primary,
           fontSize: 22.fSize,

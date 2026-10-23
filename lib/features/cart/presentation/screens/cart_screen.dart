@@ -1091,14 +1091,23 @@ class _CartScreenState extends State<CartScreen> {
       }
     }
 
-    // 3. Subtotal
-    final directSum = state.essentialItems.fold<num>(
-      0,
-      (sum, item) =>
-          sum +
-          (CheckoutPricing.parseItemPrice(item.price, isEssential: item.isEssential) *
-              item.quantity),
-    );
+    // 3. Subtotal. Kids and essentials stay out of the kit price.
+    num lineAmount(List<CartItem> items) {
+      return items.fold<num>(
+        0,
+        (sum, item) =>
+            sum +
+            (CheckoutPricing.parseItemPrice(
+                  item.price,
+                  isEssential: item.isEssential,
+                ) *
+                item.quantity),
+      );
+    }
+
+    final kidsAmount = lineAmount(state.kidsItems);
+    final essentialsAmount = lineAmount(state.essentialsOnlyItems);
+    final directSum = kidsAmount + essentialsAmount;
     num subtotal = isSubscription ? 0 : (kitPrice + directSum);
     if (subtotal <= 0 && state.remote.subtotal > 0) {
       subtotal = state.remote.subtotal;
@@ -1125,6 +1134,8 @@ class _CartScreenState extends State<CartScreen> {
 
     return _CartBreakdownAmounts(
       kitPrice: kitPrice,
+      kidsAmount: kidsAmount,
+      essentialsAmount: essentialsAmount,
       depositAmount: depositAmount,
       subtotal: subtotal,
       deliveryFee: deliveryFee,
@@ -1392,11 +1403,25 @@ class _CartScreenState extends State<CartScreen> {
         _DottedDivider(color: Colors.white24, dashWidth: 4, dashSpace: 4),
         SizedBox(height: 16.h),
 
-        // Items Subtotal
+        // Kit value is the kit price only. Kids and essentials are separate.
         _buildSummaryRow(
-          'Items Subtotal',
-          _formatCurrency(amounts.subtotal, forceDecimals: true),
+          'Kit Value',
+          _formatCurrency(amounts.kitPrice, forceDecimals: true),
         ),
+        if (amounts.kidsAmount > 0) ...[
+          SizedBox(height: 12.h),
+          _buildSummaryRow(
+            'Kids',
+            _formatCurrency(amounts.kidsAmount, forceDecimals: true),
+          ),
+        ],
+        if (amounts.essentialsAmount > 0) ...[
+          SizedBox(height: 12.h),
+          _buildSummaryRow(
+            'Essentials',
+            _formatCurrency(amounts.essentialsAmount, forceDecimals: true),
+          ),
+        ],
         SizedBox(height: 12.h),
 
         // Delivery Fee
@@ -1733,6 +1758,8 @@ class _CartScreenState extends State<CartScreen> {
 class _CartBreakdownAmounts {
   const _CartBreakdownAmounts({
     required this.kitPrice,
+    required this.kidsAmount,
+    required this.essentialsAmount,
     required this.depositAmount,
     required this.subtotal,
     required this.deliveryFee,
@@ -1743,6 +1770,8 @@ class _CartBreakdownAmounts {
   });
 
   final num kitPrice;
+  final num kidsAmount;
+  final num essentialsAmount;
   final num depositAmount;
   final num subtotal;
   final num deliveryFee;

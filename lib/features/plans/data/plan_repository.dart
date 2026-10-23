@@ -62,6 +62,7 @@ class PlanRepository {
       queryParameters: {
         'category_id': categoryId,
         'catgory_id': categoryId,
+        'categoryId': categoryId,
       },
     );
 
@@ -85,14 +86,22 @@ class PlanRepository {
   }
 
   List<PlanCategory> _parseCategories(dynamic data) {
-    if (data is! List) {
+    dynamic listData = data;
+    if (listData is Map<String, dynamic>) {
+      listData = listData['categories'] ??
+          listData['data'] ??
+          listData['rows'] ??
+          listData['items'];
+    }
+
+    if (listData is! List) {
       throw const ApiException('Invalid plan categories response');
     }
 
-    final categories = data
+    final categories = listData
         .whereType<Map<String, dynamic>>()
         .map(PlanCategory.fromJson)
-        .where((c) => c.id.isNotEmpty && c.name.isNotEmpty && c.isActive)
+        .where((c) => c.name.isNotEmpty && c.isActive)
         .toList();
 
     categories.sort((a, b) => a.displayOrder.compareTo(b.displayOrder));
@@ -100,14 +109,22 @@ class PlanRepository {
   }
 
   List<WardrobePlan> _parsePlans(dynamic data) {
-    if (data is! List) {
+    dynamic listData = data;
+    if (listData is Map<String, dynamic>) {
+      listData = listData['plans'] ??
+          listData['data'] ??
+          listData['rows'] ??
+          listData['items'];
+    }
+
+    if (listData is! List) {
       throw const ApiException('Invalid plans response');
     }
 
-    final plans = data
+    final plans = listData
         .whereType<Map<String, dynamic>>()
         .map(WardrobePlan.fromJson)
-        .where((p) => p.id.isNotEmpty && p.name.isNotEmpty && p.isActive)
+        .where((p) => (p.id.isNotEmpty || p.name.isNotEmpty) && p.isActive)
         .toList();
 
     plans.sort((a, b) => a.displayOrder.compareTo(b.displayOrder));

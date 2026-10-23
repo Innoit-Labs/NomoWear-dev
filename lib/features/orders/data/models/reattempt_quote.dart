@@ -1,17 +1,26 @@
 class ReattemptQuote {
   final String orderId;
-  final num deliveryCharge;
-  final num distanceKm;
-  final bool isFreeReattempt;
+  final bool isFree;
+  final num reattemptCharge;
+  final num unpaidPreviousCharges;
   final num totalPayable;
+  final String? membershipTierName;
+  final bool isSubscriptionUser;
+  final bool isPrimeCustomer;
 
   const ReattemptQuote({
     required this.orderId,
-    this.deliveryCharge = 0,
-    this.distanceKm = 0,
-    this.isFreeReattempt = false,
+    this.isFree = false,
+    this.reattemptCharge = 0,
+    this.unpaidPreviousCharges = 0,
     this.totalPayable = 0,
+    this.membershipTierName,
+    this.isSubscriptionUser = false,
+    this.isPrimeCustomer = false,
   });
+
+  /// Free when the quote says so, or when nothing is payable.
+  bool get isFreeReattempt => isFree || totalPayable <= 0;
 
   factory ReattemptQuote.fromJson(Map<String, dynamic> json) {
     num parseNum(dynamic value) {
@@ -30,22 +39,27 @@ class ReattemptQuote {
       return false;
     }
 
-    final dCharge = parseNum(json['deliveryCharge'] ?? json['delivery_charge']);
-    final totPayable = parseNum(
-      json['totalPayable'] ?? json['total_payable'] ?? dCharge,
-    );
+    final total = parseNum(json['totalPayable'] ?? json['total_payable']);
 
     return ReattemptQuote(
       orderId: (json['orderId'] ?? json['order_id'] ?? '').toString(),
-      deliveryCharge: dCharge,
-      distanceKm: parseNum(
-        json['distance_km'] ?? json['distanceKm'] ?? json['distance'],
+      isFree: parseBool(json['isFree'] ?? json['is_free']),
+      reattemptCharge: parseNum(
+        json['reattemptCharge'] ?? json['reattempt_charge'],
       ),
-      isFreeReattempt: parseBool(
-            json['isFreeReattempt'] ?? json['is_free_reattempt'],
-          ) ||
-          totPayable <= 0,
-      totalPayable: totPayable,
+      unpaidPreviousCharges: parseNum(
+        json['unpaidPreviousCharges'] ?? json['unpaid_previous_charges'],
+      ),
+      totalPayable: total,
+      membershipTierName: (json['membershipTierName'] ??
+              json['membership_tier_name'])
+          ?.toString(),
+      isSubscriptionUser: parseBool(
+        json['isSubscriptionUser'] ?? json['is_subscription_user'],
+      ),
+      isPrimeCustomer: parseBool(
+        json['isPrimeCustomer'] ?? json['is_prime_customer'],
+      ),
     );
   }
 }

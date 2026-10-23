@@ -46,6 +46,34 @@ class ActiveSubscription {
   final String? createdAt;
   final List<String> features;
 
+  Map<String, dynamic> toMap() {
+    return {
+      'id': id,
+      'planRef': planRef,
+      'planStatus': planStatus,
+      'planName': planName,
+      'kitDurationDays': kitDurationDays,
+      'maxGarments': maxGarments,
+      'noOfBookings': noOfBookings,
+      'planPrice': planPrice,
+      'billingPeriod': billingPeriod,
+      if (bookingsUsed != null) 'bookingsUsed': bookingsUsed,
+      if (remainingBookings != null) 'remainingBookings': remainingBookings,
+      if (usedGarments != null) 'usedGarments': usedGarments,
+      if (remainingGarments != null) 'remainingGarments': remainingGarments,
+      if (remainingKitDays != null) 'remainingKitDays': remainingKitDays,
+      if (startDate != null) 'startDate': startDate,
+      if (endDate != null) 'endDate': endDate,
+      if (nextRenewalDate != null) 'nextRenewalDate': nextRenewalDate,
+      if (createdAt != null) 'createdAt': createdAt,
+      'features': features,
+    };
+  }
+
+  @override
+  String toString() =>
+      'ActiveSubscription(id: $id, planName: $planName, status: $planStatus, price: $planPrice, billingPeriod: $billingPeriod, bookings: $bookingsUsed/$noOfBookings, garments: $usedGarments/$maxGarments, startDate: $startDate, endDate: $endDate)';
+
   DateTime? get sortDate {
     for (final iso in [createdAt, startDate, endDate]) {
       if (iso == null || iso.isEmpty) continue;
