@@ -6,6 +6,84 @@ class CategoriesScreen extends StatelessWidget {
   final bool isTab;
   const CategoriesScreen({Key? key, this.isTab = false}) : super(key: key);
 
+  static String garmentForTitle(String title) {
+    switch (title.trim().toLowerCase()) {
+      case 't-shirts':
+        return 't-shirt';
+      case 'shirts':
+        return 'shirt';
+      case 'kurtas':
+        return 'kurta';
+      case 'jeans':
+        return 'jeans';
+      case 'trousers':
+        return 'trousers';
+      case 'sarees':
+        return 'saree';
+      case 'kurtis':
+        return 'kurti';
+      case 'girls':
+        return 'girls';
+      case 'boys':
+        return 'boys';
+      case 'socks':
+        return 'socks';
+      case 'innerwear':
+        return 'innerwear';
+      case 'kerchiefs':
+        return 'kerchief';
+      case 'boxers':
+        return 'boxers';
+      default:
+        return title.trim().toLowerCase();
+    }
+  }
+
+  static String? genderForSection(String section, String title) {
+    switch (section.trim().toLowerCase()) {
+      case 'men':
+        return 'men';
+      case 'women':
+        return 'women';
+      case 'kids':
+        final t = title.trim().toLowerCase();
+        if (t == 'girls') return 'girl';
+        if (t == 'boys') return 'boy';
+        return null;
+      default:
+        return null;
+    }
+  }
+
+  static String? tabForSection(String section) {
+    switch (section.trim().toLowerCase()) {
+      case 'kids':
+        return 'Kids Wardrobe';
+      case 'essentials':
+        return 'Essentials Wardrobe';
+      default:
+        return null;
+    }
+  }
+
+  void _openCategory(
+    BuildContext context, {
+    required String section,
+    required String title,
+  }) {
+    Navigator.pushNamed(
+      context,
+      AppRoutes.categoryProductsScreen,
+      arguments: {
+        'title': title,
+        'section': section,
+        'garment': garmentForTitle(title),
+        'gender': genderForSection(section, title),
+        'tab': tabForSection(section),
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -64,33 +142,32 @@ class CategoriesScreen extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _buildSection("Men", [
-                  _item("T-Shirts", IconConstant.iconTShirts),
-                  _item("Shirts", IconConstant.iconShirts),
-                  _item("Kurtas", IconConstant.iconKurtas),
-                  _item("Jeans", IconConstant.iconJeans),
-                  _item("Trousers", IconConstant.iconTrousers),
+                _buildSection(context, "Men", [
+                  _item(context, "Men", "T-Shirts", IconConstant.iconTShirts),
+                  _item(context, "Men", "Shirts", IconConstant.iconShirts),
+                  _item(context, "Men", "Kurtas", IconConstant.iconKurtas),
+                  _item(context, "Men", "Jeans", IconConstant.iconJeans),
+                  _item(context, "Men", "Trousers", IconConstant.iconTrousers),
                 ]),
 
-                _buildSection("Women", [
-                  _item("T-Shirts", IconConstant.iconWTShirts),
-                  _item("Shirts", IconConstant.iconWShirts),
-                  _item("Sarees", IconConstant.iconSarees),
-                  _item("Kurtis", IconConstant.iconWKurtis),
-                  _item("Jeans", IconConstant.iconWJeans),
+                _buildSection(context, "Women", [
+                  _item(context, "Women", "T-Shirts", IconConstant.iconWTShirts),
+                  _item(context, "Women", "Shirts", IconConstant.iconWShirts),
+                  _item(context, "Women", "Sarees", IconConstant.iconSarees),
+                  _item(context, "Women", "Kurtis", IconConstant.iconWKurtis),
+                  _item(context, "Women", "Jeans", IconConstant.iconWJeans),
                 ]),
 
-                _buildSection("Kids", [
-                  _item("Girls", IconConstant.iconKGirls),
-                  _item("Boys", IconConstant.iconKBoys),
+                _buildSection(context, "Kids", [
+                  _item(context, "Kids", "Girls", IconConstant.iconKGirls),
+                  _item(context, "Kids", "Boys", IconConstant.iconKBoys),
                 ]),
 
-                _buildSection("Essentials", [
-                  _item("Socks", IconConstant.iconSocks),
-                  _item("Innerwear", IconConstant.iconInnerwear),
-                  _item("Accessories", IconConstant.iconAccessories),
-                  _item("Kerchiefs", IconConstant.iconKerchiefs),
-                  _item("Boxers", IconConstant.iconBoxers),
+                _buildSection(context, "Essentials", [
+                  _item(context, "Essentials", "Socks", IconConstant.iconSocks),
+                  _item(context, "Essentials", "Innerwear", IconConstant.iconInnerwear),
+                  _item(context, "Essentials", "Kerchiefs", IconConstant.iconKerchiefs),
+                  _item(context, "Essentials", "Boxers", IconConstant.iconBoxers),
                 ]),
               ],
             ),
@@ -104,7 +181,7 @@ class CategoriesScreen extends StatelessWidget {
   }
 
   // ================= SECTION =================
-  Widget _buildSection(String title, List<Widget> items) {
+  Widget _buildSection(BuildContext context, String title, List<Widget> items) {
     return Padding(
       padding: EdgeInsets.only(bottom: 20.h),
       child: Column(
@@ -158,26 +235,35 @@ class CategoriesScreen extends StatelessWidget {
     );
   }
   // ================= ITEM =================
-  Widget _item(String title, String iconPath) {
-    return Container(
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppColours.primary, width: 1.5),
-      ),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          SvgPicture.asset(
-            iconPath,
-            height: 28,
-            width: 28,
-          ),
-          SizedBox(height: 8.h),
-          Text(
-            title,
-            style: CustomTextStyles.openSansBold.copyWith(fontSize: 12),
-          ),
-        ],
+  Widget _item(
+    BuildContext context,
+    String section,
+    String title,
+    String iconPath,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: () => _openCategory(context, section: section, title: title),
+      child: Container(
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: AppColours.primary, width: 1.5),
+        ),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            SvgPicture.asset(
+              iconPath,
+              height: 28,
+              width: 28,
+            ),
+            SizedBox(height: 8.h),
+            Text(
+              title,
+              style: CustomTextStyles.openSansBold.copyWith(fontSize: 12),
+            ),
+          ],
+        ),
       ),
     );
   }
