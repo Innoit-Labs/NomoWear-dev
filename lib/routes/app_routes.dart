@@ -7,6 +7,7 @@ import 'package:nomowear/features/profile/presentation/screens/edit_profile_scre
 import 'package:nomowear/features/home/presentation/screens/home_screen.dart';
 import 'package:nomowear/features/notifications/presentation/screens/notifications_screen.dart';
 import 'package:nomowear/features/categories/presentation/screens/categories_screen.dart';
+import 'package:nomowear/features/categories/presentation/screens/category_products_screen.dart';
 import 'package:nomowear/features/wardrobe/presentation/screens/wardrobe_screen.dart';
 import 'package:nomowear/features/auth/presentation/screens/choose_your_wardrobe_kit_screen.dart';
 import 'package:nomowear/features/auth/presentation/screens/add_new_address_screen.dart';
@@ -44,6 +45,7 @@ class AppRoutes {
   static const String homeScreen = '/home_screen';
   static const String notificationsScreen = '/notifications_screen';
   static const String categoriesScreen = '/categories_screen';
+  static const String categoryProductsScreen = '/category_products_screen';
   static const String wardrobeScreen = '/wardrobe_screen';
   static const String chooseYourWardrobeKitScreen = '/choose_your_wardrobe_kit_screen';
   static const String screenshotScreen = chooseYourWardrobeKitScreen;
@@ -101,6 +103,34 @@ class AppRoutes {
     },
     notificationsScreen: (context) => const NotificationsScreen(),
     categoriesScreen: (context) => const CategoriesScreen(),
+    categoryProductsScreen: (context) {
+      final args = ModalRoute.of(context)?.settings.arguments;
+      String title = 'Products';
+      String section = '';
+      String garment = 'shirt';
+      String? gender;
+      String? tab;
+      if (args is Map) {
+        title = args['title']?.toString().trim().isNotEmpty == true
+            ? args['title'].toString().trim()
+            : title;
+        section = args['section']?.toString().trim() ?? '';
+        garment = args['garment']?.toString().trim().isNotEmpty == true
+            ? args['garment'].toString().trim()
+            : CategoriesScreen.garmentForTitle(title);
+        final g = args['gender']?.toString().trim();
+        gender = (g != null && g.isNotEmpty) ? g : null;
+        final t = args['tab']?.toString().trim();
+        tab = (t != null && t.isNotEmpty) ? t : null;
+      }
+      return CategoryProductsScreen(
+        title: title,
+        section: section,
+        garment: garment,
+        gender: gender,
+        tab: tab,
+      );
+    },
     wardrobeScreen: (context) {
       final category =
           ModalRoute.of(context)!.settings.arguments as String? ?? '';

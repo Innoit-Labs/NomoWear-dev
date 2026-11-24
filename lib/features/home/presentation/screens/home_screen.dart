@@ -520,7 +520,7 @@ class _HomeScreenState extends State<HomeScreen> {
       index: index,
       children: [
         _buildHomeContent(),
-        const CategoriesScreen(isTab: true),
+        CategoriesScreen(isTab: true),
         CartScreen(
           key: const ValueKey('home_cart_tab'),
           isActive: index == 2,

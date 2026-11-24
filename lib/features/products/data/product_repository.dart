@@ -55,12 +55,14 @@ class ProductRepository {
     String? age,
     String? gender,
     String? tab,
+    String? garment,
     int? page,
     int? limit,
   }) async {
     final actionParam = action?.trim().toLowerCase();
     final ageParam = age?.trim();
     final genderParam = gender?.trim();
+    final garmentParam = garment?.trim();
     var tabParam = tab?.trim();
     if (tabParam != null && tabParam.toLowerCase() == 'kidswardrobe') {
       tabParam = 'Kids Wardrobe';
@@ -107,117 +109,23 @@ class ProductRepository {
         String locationSource = '';
 
         if (isKidsOrEssentials) {
-          // ── Device GPS location for Kids / Essentials ────────────────
-          // Strategy:
-          //  1. getLastKnownPosition() — instant, cached by the OS
-          //  2. getCurrentPosition() with 10 s timeout
-          //  3. One retry if the first attempt times out
-          //  4. Fall back to last-known if fresh location fails
-
-          final categoryLabel = tabParam ?? actionParam ?? 'unknown';
-
-          var permission = await Geolocator.checkPermission();
-          if (permission == LocationPermission.denied) {
-            permission = await Geolocator.requestPermission();
-          }
-
-          final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-
-          if (kDebugMode) {
-            debugPrint('[LOCATION_DEBUG]');
-            debugPrint('category=$categoryLabel');
-            debugPrint('permission=$permission');
-            debugPrint('serviceEnabled=$serviceEnabled');
-          }
-
-          if (permission != LocationPermission.whileInUse &&
-              permission != LocationPermission.always) {
-            if (kDebugMode) {
-              debugPrint('[LOCATION_DEBUG] callingApi=false reason=Permission denied');
-            }
-            throw const ApiException(
-              'Location is missing. Please grant location permission.',
-            );
-          }
-
-          if (!serviceEnabled) {
-            if (kDebugMode) {
-              debugPrint('[LOCATION_DEBUG] callingApi=false reason=Location service disabled');
-            }
-            throw const ApiException(
-              'Location is missing. Location services are disabled.',
-            );
-          }
-
-          // Step 1: last-known position (instant, may be null on first use)
-          Position? lastKnown;
-          try {
-            lastKnown = await Geolocator.getLastKnownPosition();
-          } catch (_) {}
-
-          if (kDebugMode) {
-            debugPrint('[LOCATION_DEBUG] lastKnownLocation='
-                '${lastKnown != null ? '${lastKnown.latitude},${lastKnown.longitude}' : 'null'}');
-          }
-
-          // Step 2: fresh GPS position with reasonable timeout
-          const locationTimeout = Duration(seconds: 10);
-          Position? freshPosition;
-
-          for (var attempt = 1; attempt <= 2; attempt++) {
-            try {
-              if (kDebugMode) {
-                debugPrint('[LOCATION_DEBUG] requestingCurrentLocation=true '
-                    'attempt=$attempt timeout=${locationTimeout.inSeconds}s');
-              }
-              freshPosition = await Geolocator.getCurrentPosition(
-                desiredAccuracy: LocationAccuracy.medium,
-                timeLimit: locationTimeout,
-              );
-              if (kDebugMode) {
-                debugPrint('[LOCATION_DEBUG] currentLocation='
-                    '${freshPosition.latitude},${freshPosition.longitude} '
-                    'attempt=$attempt');
-              }
-              break; // success — no retry needed
-            } catch (e) {
-              if (kDebugMode) {
-                debugPrint('[LOCATION_DEBUG] attempt=$attempt failed=${e.runtimeType}: $e');
-              }
-              // Only retry on timeout; other errors (e.g. permission revoked) fail immediately
-              final isTimeout = e.toString().contains('TimeoutException');
-              if (!isTimeout || attempt == 2) break;
-              // brief pause before retry to let GPS settle
-              await Future<void>.delayed(const Duration(milliseconds: 500));
-            }
-          }
-
-          // Step 3: pick the best available location
-          if (freshPosition != null) {
-            activeLatitude = freshPosition.latitude;
-            activeLongitude = freshPosition.longitude;
-            locationSource = 'current_device';
-          } else if (lastKnown != null) {
-            activeLatitude = lastKnown.latitude;
-            activeLongitude = lastKnown.longitude;
-            locationSource = 'last_known';
-          }
-
-          if (kDebugMode) {
-            debugPrint('[LOCATION_DEBUG] '
-                'latitude=$activeLatitude '
-                'longitude=$activeLongitude '
-                'locationSource=$locationSource');
-          }
+          // Kids / Essentials: prefer device GPS.
+          final device = await _resolveDeviceLocation(
+            categoryLabel: tabParam ?? actionParam ?? garmentParam ?? 'unknown',
+            throwOnFailure: true,
+          );
+          activeLatitude = device.latitude;
+          activeLongitude = device.longitude;
+          locationSource = device.source;
         } else {
-          // ── Wardrobe product listing: use the selected delivery address ───────
+          // ── Wardrobe / category browse: delivery address first ───────
           // Priority:
-          //  1. Coordinates stored in CheckoutSession when user confirmed kit/address
-          //  2. Matching saved address lat/lng from userSavedAddresses
+          //  1. CheckoutSession coords
+          //  2. Saved address lat/lng
           //  3. Profile lat/lng
           //  4. Google Maps geocode of address text
+          //  5. Device GPS (category browse from home has no kit address)
 
-          // 1. CheckoutSession coordinates (set when user tapped NEXT in Kit screen)
           final sessionLat = CheckoutSession.instance.addressLatitude;
           final sessionLng = CheckoutSession.instance.addressLongitude;
           if (sessionLat != null && sessionLng != null) {
@@ -226,7 +134,6 @@ class ProductRepository {
             locationSource = 'session_address';
           }
 
-          // 2. Saved address lookup (if session coords missing)
           if (activeLatitude == null || activeLongitude == null) {
             SavedAddress? selectedAddress;
             if (checkoutAddressId != null && userSavedAddresses.isNotEmpty) {
@@ -249,17 +156,15 @@ class ProductRepository {
             } else if (profile != null &&
                 profile.latitude != null &&
                 profile.longitude != null) {
-              // 3. Profile lat/lng
               activeLatitude = profile.latitude;
               activeLongitude = profile.longitude;
               locationSource = 'profile';
             } else {
-              // 4. Google Maps geocode fallback
-              // Use the address text from the matched address, or fall back to
-              // CheckoutSession.addressLines (set from the Kit screen NEXT button).
-              final addressText = (selectedAddress != null && selectedAddress.addressLines.trim().isNotEmpty)
+              final addressText = (selectedAddress != null &&
+                      selectedAddress.addressLines.trim().isNotEmpty)
                   ? selectedAddress.addressLines
-                  : (selectedAddress != null && selectedAddress.title.trim().isNotEmpty)
+                  : (selectedAddress != null &&
+                          selectedAddress.title.trim().isNotEmpty)
                       ? selectedAddress.title
                       : CheckoutSession.instance.addressLines;
               if (addressText != null && addressText.isNotEmpty) {
@@ -268,14 +173,12 @@ class ProductRepository {
                   final predictions =
                       await mapsService.searchPlaces(addressText);
                   if (predictions.isNotEmpty) {
-                    final resolved =
-                        await mapsService.resolvePlace(predictions.first.placeId);
+                    final resolved = await mapsService
+                        .resolvePlace(predictions.first.placeId);
                     if (resolved != null) {
                       activeLatitude = resolved.latitude;
                       activeLongitude = resolved.longitude;
                       locationSource = 'geocode';
-                      // Cache the resolved coordinates in CheckoutSession so
-                      // the next screen load doesn't need to geocode again.
                       CheckoutSession.instance.setDelivery(
                         addressLatitude: activeLatitude,
                         addressLongitude: activeLongitude,
@@ -286,11 +189,27 @@ class ProductRepository {
               }
             }
           }
+
+          // Category browse often has no kit address — fall back to GPS.
+          if (activeLatitude == null || activeLongitude == null) {
+            final device = await _resolveDeviceLocation(
+              categoryLabel:
+                  tabParam ?? actionParam ?? garmentParam ?? 'unknown',
+              throwOnFailure: false,
+            );
+            if (device.latitude != null && device.longitude != null) {
+              activeLatitude = device.latitude;
+              activeLongitude = device.longitude;
+              locationSource = device.source;
+            }
+          }
         }
 
         if (kDebugMode) {
           debugPrint('CATEGORY_LOCATION_DEBUG');
-          debugPrint('category = ${tabParam ?? actionParam ?? "unknown"}');
+          debugPrint(
+            'category = ${tabParam ?? actionParam ?? garmentParam ?? "unknown"}',
+          );
           debugPrint('locationSource = $locationSource');
           debugPrint('latitude = $activeLatitude');
           debugPrint('longitude = $activeLongitude');
@@ -298,9 +217,13 @@ class ProductRepository {
 
         if (activeLatitude == null || activeLongitude == null) {
           if (isKidsOrEssentials) {
-            throw const ApiException('Location is missing. Please enable device location.');
+            throw const ApiException(
+              'Location is missing. Please enable device location.',
+            );
           } else {
-            throw const ApiException('Location is missing. Please select a delivery address.');
+            throw const ApiException(
+              'Location is missing. Please enable location or select a delivery address.',
+            );
           }
         }
 
@@ -331,6 +254,9 @@ class ProductRepository {
       }
       if (genderParam != null && genderParam.isNotEmpty) {
         query['gender'] = genderParam;
+      }
+      if (garmentParam != null && garmentParam.isNotEmpty) {
+        query['garment'] = garmentParam;
       }
 
       final isKidsOrEssentialsLogging = (tabParam != null && 
@@ -456,6 +382,134 @@ class ProductRepository {
         _inFlightProductsRequest = null;
       }
     }
+  }
+
+  /// Device GPS for nearby product calls.
+  ///
+  /// Uses last-known, then a fresh fix (one retry on timeout). When
+  /// [throwOnFailure] is false, returns null coords instead of throwing so
+  /// callers can try another source.
+  Future<({double? latitude, double? longitude, String source})>
+      _resolveDeviceLocation({
+    required String categoryLabel,
+    required bool throwOnFailure,
+  }) async {
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+
+    if (kDebugMode) {
+      debugPrint('[LOCATION_DEBUG]');
+      debugPrint('category=$categoryLabel');
+      debugPrint('permission=$permission');
+      debugPrint('serviceEnabled=$serviceEnabled');
+    }
+
+    if (permission != LocationPermission.whileInUse &&
+        permission != LocationPermission.always) {
+      if (kDebugMode) {
+        debugPrint(
+          '[LOCATION_DEBUG] callingApi=false reason=Permission denied',
+        );
+      }
+      if (throwOnFailure) {
+        throw const ApiException(
+          'Location is missing. Please grant location permission.',
+        );
+      }
+      return (latitude: null, longitude: null, source: '');
+    }
+
+    if (!serviceEnabled) {
+      if (kDebugMode) {
+        debugPrint(
+          '[LOCATION_DEBUG] callingApi=false reason=Location service disabled',
+        );
+      }
+      if (throwOnFailure) {
+        throw const ApiException(
+          'Location is missing. Location services are disabled.',
+        );
+      }
+      return (latitude: null, longitude: null, source: '');
+    }
+
+    Position? lastKnown;
+    try {
+      lastKnown = await Geolocator.getLastKnownPosition();
+    } catch (_) {}
+
+    if (kDebugMode) {
+      debugPrint(
+        '[LOCATION_DEBUG] lastKnownLocation='
+        '${lastKnown != null ? '${lastKnown.latitude},${lastKnown.longitude}' : 'null'}',
+      );
+    }
+
+    const locationTimeout = Duration(seconds: 10);
+    Position? freshPosition;
+
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        if (kDebugMode) {
+          debugPrint(
+            '[LOCATION_DEBUG] requestingCurrentLocation=true '
+            'attempt=$attempt timeout=${locationTimeout.inSeconds}s',
+          );
+        }
+        freshPosition = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium,
+          timeLimit: locationTimeout,
+        );
+        if (kDebugMode) {
+          debugPrint(
+            '[LOCATION_DEBUG] currentLocation='
+            '${freshPosition.latitude},${freshPosition.longitude} '
+            'attempt=$attempt',
+          );
+        }
+        break;
+      } catch (e) {
+        if (kDebugMode) {
+          debugPrint(
+            '[LOCATION_DEBUG] attempt=$attempt failed=${e.runtimeType}: $e',
+          );
+        }
+        final isTimeout = e.toString().contains('TimeoutException');
+        if (!isTimeout || attempt == 2) break;
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+      }
+    }
+
+    if (freshPosition != null) {
+      return (
+        latitude: freshPosition.latitude,
+        longitude: freshPosition.longitude,
+        source: 'current_device',
+      );
+    }
+    if (lastKnown != null) {
+      return (
+        latitude: lastKnown.latitude,
+        longitude: lastKnown.longitude,
+        source: 'last_known',
+      );
+    }
+
+    if (kDebugMode) {
+      debugPrint(
+        '[LOCATION_DEBUG] latitude=null longitude=null locationSource=',
+      );
+    }
+    if (throwOnFailure) {
+      throw const ApiException(
+        'Location is missing. Please enable device location.',
+      );
+    }
+    return (latitude: null, longitude: null, source: '');
   }
 
   /// Loads Home wardrobe cards by calling each Admin tab. Empty tabs are omitted.
